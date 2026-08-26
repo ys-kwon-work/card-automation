@@ -169,9 +169,9 @@ def main():
                     continue
 
                 print(f"    파싱 {len(transactions)}건")
-                added = append_rows_to_sheet(s["card_name"], transactions, filename=filename)
-                print(f"    시트에 {added}행 추가 완료")
-                total_rows += added
+                result = append_rows_to_sheet(s["card_name"], transactions, filename=filename)
+                print(f"    시트에 {result['added']}행 추가, {result['skipped']}건 중복 건너뜀")
+                total_rows += result["added"]
         print()
 
     mail.logout()

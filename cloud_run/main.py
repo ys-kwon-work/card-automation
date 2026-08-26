@@ -18,6 +18,9 @@ Apps Script가 Gmail에서 찾은 첨부파일(base64)을 이 서비스로 보�
        ("gemini" 또는 "claude", 기본값 "claude"). 둘 다 코드에 남겨뒀으니 필요하면
        언제든 다른 쪽으로 바꿀 수 있음.
   4. Google Sheets API로 기존 시트(카드명·일자·가맹점·금액·분류)에 행 추가
+     — 단, (카드명, 일자, 가맹점, 금액)이 이미 시트에 있는 거래는 건너뜀(중복 방지).
+       라벨이 붙지 않아 같은 메일이 다시 들어오거나, 수동 강제 재처리를 해도
+       시트에는 중복 행이 쌓이지 않음.
 
 2026-08-25 로컬 테스트로 확인된 사실 (실제 파일 + 실제 비밀번호로 검증):
   - BC바로카드 PDF: pypdf로 복호화 자체는 성공하지만, pdfplumber로 텍스트를
@@ -486,7 +489,25 @@ def ensure_tab(service, spreadsheet_id: str, tab_name: str) -> None:
     ).execute()
 
 
-def append_rows_to_sheet(card_name: str, transactions: list[dict], filename: str = "") -> int:
+def _existing_transaction_keys(service, spreadsheet_id: str, tab_name: str) -> set[tuple]:
+    """탭에 이미 기록된 거래를 (카드명, 일자, 가맹점, 금액) 키 집합으로 반환합니다.
+    소계/합계 행은 제외합니다. 같은 명세서를 다시 처리하거나(라벨 유실, 수동 강제
+    재처리 등) 같은 거래가 중복 삽입되는 것을 막는 데 씁니다."""
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_name}!A2:E100000",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    keys: set[tuple] = set()
+    for r in resp.get("values", []):
+        if not r or r[0] == GRAND_TOTAL_LABEL or str(r[0]).endswith(SUBTOTAL_SUFFIX):
+            continue
+        card, day, merchant, amount, _category = (r + ["", "", "", "", ""])[:5]
+        keys.add((card, _normalize_date_cell_value(day), str(merchant), _to_amount(amount)))
+    return keys
+
+
+def append_rows_to_sheet(card_name: str, transactions: list[dict], filename: str = "") -> dict:
     creds_info = json.loads(os.environ["SHEETS_SERVICE_ACCOUNT_JSON"])
     creds = service_account.Credentials.from_service_account_info(
         creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -494,26 +515,32 @@ def append_rows_to_sheet(card_name: str, transactions: list[dict], filename: str
     service = build("sheets", "v4", credentials=creds)
     spreadsheet_id = os.environ["SHEET_ID"]
 
-    rows = [
-        [card_name, t["일자"], t["가맹점"], t["금액"], t["분류"]]
-        for t in transactions
-    ]
-    if not rows:
-        return 0
-
     tab_name = month_tab_name(filename)
     ensure_tab(service, spreadsheet_id, tab_name)
 
-    service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_name}!A:E",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
-    ).execute()
+    existing_keys = _existing_transaction_keys(service, spreadsheet_id, tab_name)
 
-    apply_card_totals(service, spreadsheet_id, tab_name)
-    return len(rows)
+    rows: list[list] = []
+    skipped = 0
+    for t in transactions:
+        key = (card_name, t["일자"], t["가맹점"], _to_amount(t["금액"]))
+        if key in existing_keys:
+            skipped += 1
+            continue
+        existing_keys.add(key)  # 같은 요청 안의 거래끼리도 중복 방지
+        rows.append([card_name, t["일자"], t["가맹점"], t["금액"], t["분류"]])
+
+    if rows:
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_name}!A:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+        apply_card_totals(service, spreadsheet_id, tab_name)
+
+    return {"added": len(rows), "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -700,9 +727,14 @@ def process():
             raw_text = decrypt_samsung_html(file_bytes, password)
             transactions = parse_transactions(card_name, raw_text=raw_text)
 
-        rows_added = append_rows_to_sheet(card_name, transactions, filename=filename)
+        result = append_rows_to_sheet(card_name, transactions, filename=filename)
 
-        return jsonify({"status": "ok", "rows_added": rows_added, "transactions": transactions})
+        return jsonify({
+            "status": "ok",
+            "rows_added": result["added"],
+            "rows_skipped": result["skipped"],
+            "transactions": transactions,
+        })
 
     except Exception as exc:  # noqa: BLE001 — Apps Script가 실패를 보고 라벨을 걸지 않도록 전달
         return jsonify({"status": "error", "message": str(exc)}), 500

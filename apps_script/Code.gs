@@ -1,9 +1,16 @@
 /**
  * 카드 명세서 자동 처리 — Gmail 감지 + Cloud Run 호출
  * -------------------------------------------------------
- * 1. checkNewStatements()  : 시간 트리거로 주기 실행. 미처리 명세서 메일을 찾아
- *                            Cloud Run(/process)에 넘기고, 성공하면 라벨을 붙인다.
- * 2. createTimeTrigger()   : 최초 1회 수동 실행 — 1일 1회(매일 지정 시각) 트리거 설치.
+ * 1. checkNewStatements()  : 시간 트리거로 주기 실행(매일). "정산완료" 라벨이 없는
+ *                            명세서 메일만 찾아 Cloud Run(/process)에 넘기고,
+ *                            성공하면 라벨을 붙인다.
+ * 2. forceReprocessAll()   : 필요할 때 수동으로 실행. 라벨 여부와 상관없이 최근
+ *                            명세서 메일을 전부 다시 처리한다. Cloud Run이 시트에
+ *                            이미 있는 거래(카드명+일자+가맹점+금액 동일)는 자동으로
+ *                            건너뛰므로 중복 행 걱정 없이 실행해도 된다. 부분 실패로
+ *                            누락된 거래를 다시 채우거나, 파싱/분류 로직을 고친 뒤
+ *                            재확인할 때 사용.
+ * 3. createTimeTrigger()   : 최초 1회 수동 실행 — 1일 1회(매일 지정 시각) 트리거 설치.
  *
  * 사전 설정 (스크립트 속성, 좌측 톱니바퀴 > 프로젝트 설정 > 스크립트 속성):
  *   CLOUD_RUN_URL          예) https://card-automation-xxxxx-an.a.run.app
@@ -32,15 +39,30 @@ function getConfig_() {
 }
 
 function checkNewStatements() {
+  runCheck_(false);
+}
+
+/**
+ * 수동 강제 업데이트. "정산완료" 라벨이 이미 붙은 메일도 포함해서 다시 처리합니다.
+ * Cloud Run 쪽에서 시트에 이미 있는 거래는 자동으로 걸러내므로(main.py의
+ * _existing_transaction_keys), 이 함수를 실행해도 시트에 중복 행이 쌓이지 않습니다.
+ * Apps Script 편집기에서 이 함수를 선택해 수동 실행하세요.
+ */
+function forceReprocessAll() {
+  runCheck_(true);
+}
+
+function runCheck_(includeAlreadyLabeled) {
   const cfg = getConfig_();
   const label = getOrCreateLabel_(cfg.labelName);
+  const exclude = includeAlreadyLabeled ? '' : (' -label:' + cfg.labelName);
 
   // 카드사별로 따로 검색 — 제목 조건이 다르고, card_type을 바로 알 수 있음
   const searches = [
-    { cardType: 'BC', query: 'subject:BC바로카드 subject:명세서 -label:' + cfg.labelName },
-    { cardType: 'HYUNDAI', query: 'subject:현대카드 subject:명세서 -label:' + cfg.labelName },
-    { cardType: 'SAMSUNG', query: 'subject:삼성카드 subject:명세서 -label:' + cfg.labelName },
-    { cardType: 'SHINHAN', query: 'subject:신한카드 subject:명세서 -label:' + cfg.labelName },
+    { cardType: 'BC', query: 'subject:BC바로카드 subject:명세서' + exclude },
+    { cardType: 'HYUNDAI', query: 'subject:현대카드 subject:명세서' + exclude },
+    { cardType: 'SAMSUNG', query: 'subject:삼성카드 subject:명세서' + exclude },
+    { cardType: 'SHINHAN', query: 'subject:신한카드 subject:명세서' + exclude },
   ];
 
   searches.forEach(function (s) {
@@ -93,8 +115,8 @@ function processThread_(thread, cardType, cfg, label) {
       if (code === 200 && body.status === 'ok') {
         thread.addLabel(label);
         Logger.log(
-          '%s 처리 완료: %s건 추가 (%s)',
-          cardType, body.rows_added, attachment.getName()
+          '%s 처리 완료: %s건 추가, %s건 중복 건너뜀 (%s)',
+          cardType, body.rows_added, body.rows_skipped || 0, attachment.getName()
         );
       } else {
         Logger.log('처리 실패 [%s / %s]: %s', cardType, attachment.getName(), body.message);

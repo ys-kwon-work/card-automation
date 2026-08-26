@@ -233,6 +233,13 @@ Cloud Run 환경변수의 `PARSER_ENGINE` 값(`claude` 또는 `gemini`, 기본�
 
 ## 2단계 — Google Cloud 프로젝트 + 서비스 계정
 
+> **이 저장소는 이미 완료된 상태**: 프로젝트 `card-automation-506604` +
+> 서비스 계정 `card-automation@card-automation-506604.iam.gserviceaccount.com`이
+> 이미 만들어져 있고, 그 키 파일이 저장소 루트의
+> `card-automation-506604-148c68e844bd.json`입니다(`test_sheets_write.py`가 이
+> 파일로 시트 쓰기 테스트를 이미 통과함). 새로 만들 필요 없이 3단계로 넘어가면
+> 됩니다. 아래는 처음부터 다시 만들 때(다른 계정/프로젝트로 복제할 때) 참고용입니다.
+
 ```bash
 gcloud auth login
 gcloud projects create card-automation-YOURNAME   # 프로젝트 ID는 전역 고유해야 함
@@ -245,10 +252,20 @@ gcloud iam service-accounts keys create sa-key.json \
   --iam-account sheet-writer@card-automation-YOURNAME.iam.gserviceaccount.com
 ```
 
-`sa-key.json`에 적힌 `client_email` 값을 확인한 뒤, 대상 스프레드시트를 **편집자로 공유**하세요
-(시트 우측 상단 "공유" → 해당 이메일 추가). 이 단계를 빼먹으면 Sheets API가 403을 반환합니다.
+`sa-key.json`(또는 콘솔에서 다운받은 서비스 계정 키 파일)에 적힌 `client_email` 값을 확인한 뒤,
+대상 스프레드시트를 **편집자로 공유**하세요(시트 우측 상단 "공유" → 해당 이메일 추가).
+이 단계를 빼먹으면 Sheets API가 403을 반환합니다.
+
+> **로컬에 `gcloud` CLI가 없다면**: 설치([cloud.google.com/sdk/docs/install](https://cloud.google.com/sdk/docs/install))
+> 하거나, [console.cloud.google.com](https://console.cloud.google.com) 우측 상단 터미널
+> 아이콘(Cloud Shell)을 쓰면 설치 없이 브라우저에서 바로 `gcloud` 명령을 실행할 수 있습니다.
 
 ## 3단계 — Cloud Run 배포
+
+> **주의**: `--set-env-vars`는 값을 콤마(`,`)로 구분하는데, 서비스 계정 JSON은 필드마다
+> 콤마가 들어있어서 `--set-env-vars`에 JSON을 통째로 넣으면 `Bad syntax for dict arg`
+> 오류가 납니다. JSON처럼 콤마·따옴표가 많은 값은 아래처럼 **`env.yaml` 파일로 넘겨야**
+> 안전합니다.
 
 ```bash
 cd cloud_run
@@ -257,22 +274,31 @@ cd cloud_run
 SHARED_SECRET=$(openssl rand -hex 24)
 echo "SHARED_SECRET=$SHARED_SECRET"   # 이 값을 Apps Script 스크립트 속성에도 넣어야 함
 
+cat > env.yaml <<EOF
+SHARED_SECRET: "$SHARED_SECRET"
+PARSER_ENGINE: "claude"
+ANTHROPIC_API_KEY: "여기에_Claude_API_키"
+SHEET_ID: "1b1Y50n_AlJ4fTFGxVlmzXCEEvpt8HEyqEHD2N5buFv0"
+SHEETS_SERVICE_ACCOUNT_JSON: '$(cat ../card-automation-506604-148c68e844bd.json | tr -d '\n')'
+EOF
+
 gcloud run deploy card-automation \
   --source . \
   --region asia-northeast3 \
   --allow-unauthenticated \
   --memory 1Gi \
   --timeout 180 \
-  --set-env-vars "SHARED_SECRET=$SHARED_SECRET" \
-  --set-env-vars "PARSER_ENGINE=claude" \
-  --set-env-vars "ANTHROPIC_API_KEY=여기에_Claude_API_키" \
-  --set-env-vars "SHEET_ID=1b1Y50n_AlJ4fTFGxVlmzXCEEvpt8HEyqEHD2N5buFv0" \
-  --set-env-vars "SHEETS_SERVICE_ACCOUNT_JSON=$(cat sa-key.json | tr -d '\n')"
-
-# Gemini로 전환하고 싶다면 위 두 줄 대신 아래처럼 배포(또는 `gcloud run services update`로 변경):
-#   --set-env-vars "PARSER_ENGINE=gemini" \
-#   --set-env-vars "GEMINI_API_KEY=여기에_Gemini_API_키" \
+  --env-vars-file=env.yaml
 ```
+
+- `SHEETS_SERVICE_ACCOUNT_JSON` 값은 **작은따옴표(`'...'`)로 감싸서** YAML이 내부의
+  큰따옴표·콤마·콜론을 전부 리터럴 문자열로 처리하게 합니다(private key는 base64라
+  작은따옴표가 나올 일이 없어 안전함).
+- Gemini로 전환하고 싶다면 `env.yaml`의 `PARSER_ENGINE`을 `gemini`로, `ANTHROPIC_API_KEY`
+  줄을 `GEMINI_API_KEY: "여기에_Gemini_API_키"`로 바꾼 뒤 다시 배포(또는
+  `gcloud run services update card-automation --env-vars-file=env.yaml`)하면 됩니다.
+- 배포가 끝나면 **`env.yaml`을 삭제하거나 최소한 git에 올리지 마세요** — API 키와 서비스
+  계정 private key가 평문으로 들어있습니다(`cloud_run/.gitignore`에 이미 포함되어 있음).
 
 > `--allow-unauthenticated`로 배포하되, `main.py`가 매 요청마다 `X-Shared-Secret` 헤더를
 > 검사하므로 실질적으로는 이 값을 아는 Apps Script만 호출할 수 있습니다. 더 엄격하게
@@ -300,8 +326,29 @@ gcloud run deploy card-automation \
    | `SHINHAN_PDF_PASSWORD` | 신한카드 PDF 비밀번호 |
 
 4. 함수 목록에서 `createTimeTrigger`를 선택해 **1회 수동 실행** → Gmail 권한 승인 팝업이
-   뜨면 허용 (이때 10분 주기 트리거가 설치됩니다)
+   뜨면 허용 (이때 **매일 1회(기본 오전 8시경) 트리거**가 설치됩니다. 실행 시각을 바꾸고
+   싶으면 `Code.gs`의 `createTimeTrigger()` 안 `atHour(8)` 숫자를 원하는 시(0~23)로 고친 뒤
+   Apps Script 편집기에서 다시 저장하고 `createTimeTrigger`를 재실행하면 됩니다 — 재실행 시
+   기존 트리거는 자동으로 지우고 새로 설치합니다)
 5. 실행 > 로그에서 정상 동작 확인, 또는 `checkNewStatements`를 수동 실행해 즉시 테스트
+
+## 중복 방지 + 수동 강제 업데이트
+
+카드사 명세서는 보통 한 달에 한 번만 오지만, 트리거는 매일 실행됩니다. 정상적인
+경우 `checkNewStatements()`가 "정산완료" 라벨이 없는 메일만 찾으므로 이미 처리한
+명세서를 또 처리하지 않지만, 라벨이 무슨 이유로든 안 붙는 경우(부분 실패 등)를
+대비해 Cloud Run(`main.py`) 쪽에도 안전장치를 넣었습니다: 시트에 **(카드명, 일자,
+가맹점, 금액)이 이미 존재하는 거래는 자동으로 건너뜁니다.** 그래서 같은 메일이
+두 번 처리되어도 시트에 중복 행이 쌓이지 않습니다.
+
+이 덕분에 **수동 강제 업데이트**도 안전하게 할 수 있습니다 — Apps Script 편집기에서
+`forceReprocessAll` 함수를 선택해 수동 실행하면, 라벨이 이미 붙은 메일까지 포함해
+최근 명세서를 전부 다시 처리합니다. 이미 시트에 기록된 거래는 자동으로 건너뛰고
+누락되었던 거래만 새로 추가되므로, 아래와 같은 상황에서 쓰면 됩니다.
+
+- 현대카드 뷰어 구조 변경 등으로 일부 첨부파일만 처리 실패했을 때, 원인을 고친 뒤 재확인
+- `main.py`의 파싱/분류 프롬프트를 수정한 뒤 최근 명세서로 다시 검증하고 싶을 때
+- 매일 트리거를 기다리지 않고 지금 바로 반영하고 싶을 때
 
 ## 알아둘 점 / 남은 리스크
 
