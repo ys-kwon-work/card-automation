@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.png
+*.PDF
+*.pdf
+*.html
+card-automation-506604-148c68e844bd.json

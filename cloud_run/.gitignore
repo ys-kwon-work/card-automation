@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+bc_page_*.png
+hyundai_debug_failure.png
