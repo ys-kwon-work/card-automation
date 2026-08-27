@@ -1,15 +1,22 @@
 # 카드 명세서 자동화 — 옵션 A 구현 (Google Apps Script + Cloud Run)
 
-BC바로카드(암호 PDF) / 현대카드(보안 HTML) / 삼성카드(보안 HTML) / 신한카드(암호 PDF)
+BC바로카드(암호 PDF/엑셀) / 현대카드(보안 HTML) / 삼성카드(보안 HTML) / 신한카드(암호 PDF)
 명세서를 Gmail에서 찾아 AI(Claude 또는 Gemini, 전환 가능)로 파싱하고, 아래 시트에
 자동으로 행을 추가합니다.
 
 - 대상 시트: https://docs.google.com/spreadsheets/d/1b1Y50n_AlJ4fTFGxVlmzXCEEvpt8HEyqEHD2N5buFv0/edit
-- 헤더: `카드명 | 일자 | 가맹점 | 금액 | 분류` (한 시트에 카드명으로 구분해 계속 추가)
+- 헤더: `카드명 | 일자 | 가맹점 | 금액 | 분류`
+- 명세서 첨부파일명에서 날짜를 뽑아 **월별 탭(`YYYYMM`)** 에 기록하고, 탭이 없으면
+  헤더와 함께 자동으로 만듭니다.
+- 탭마다 **카드사별 소계 + 전체 합계** 행을 자동으로 다시 계산해 붙입니다(멱등적).
 
-## 실제 파일로 검증 완료된 내용 (2026-08-25 기준)
+> 소스 구조·함수 단위 설명은 [`SOURCE_REVIEW.md`](SOURCE_REVIEW.md)를 참고하세요. 이
+> README는 "무엇을 어떻게 세팅하고 돌리는가"에, `SOURCE_REVIEW.md`는 "코드가 어떻게
+> 동작하는가"에 집중합니다.
 
-두 카드사 실제 명세서 파일 + 실제 비밀번호로 복호화부터 AI 파싱까지 전 과정을
+## 실제 파일로 검증 완료된 내용 (2026-08-27 기준)
+
+네 카드사 모두 실제 명세서 파일 + 실제 비밀번호로 복호화부터 AI 파싱까지 전 과정을
 검증했습니다. 아래는 그 과정에서 확인된 사실과 고친 문제들입니다.
 
 - **BC바로카드 PDF**: 표준 PDF 사용자 암호로 잠겨 있고(`is_encrypted: True`), `pypdf`로
@@ -22,6 +29,19 @@ BC바로카드(암호 PDF) / 현대카드(보안 HTML) / 삼성카드(보안 HTM
     (`decrypt_bc_pdf()`가 문자열이 아니라 이미지 바이트 리스트를 반환함).
   - 실제 파일로 끝까지 테스트한 결과, AI가 파싱한 거래 금액 합계가 명세서에 찍힌
     실제 총액과 정확히 일치하는 것까지 확인됨.
+- **BC바로카드 — PDF 또는 엑셀**: BC바로카드 명세서는 PDF뿐 아니라 엑셀(`.xlsx`/`.xls`)
+  로도 올 수 있어서, 첨부파일 확장자로 자동 판별해 처리합니다(`main.py`의
+  `decrypt_bc_excel()`). PDF와 달리 엑셀 셀 값은 폰트 스크램블 문제가 없어 이미지
+  렌더링 없이 셀 값을 텍스트로 바로 추출해 AI에 넘깁니다. 엑셀도 PDF처럼 비밀번호로
+  암호화되어 있는 것이 일반적이라(`msoffcrypto-tool`로 복호화) 같은 BC 비밀번호를
+  그대로 사용하며, 복호화 후 신형(`.xlsx`, OOXML)은 `openpyxl`, 구형(`.xls`, BIFF8)은
+  `xlrd`로 셀을 읽습니다. **다만 아직 실제 BC 엑셀 샘플 파일로 검증하지 못했으니**,
+  실제 파일을 받으면 `python test_local.py bc 실제파일.xlsx`로 먼저 로컬 검증을
+  권장합니다.
+- **신한카드 PDF**: BC바로카드와 **완전히 동일한 상황**입니다 — 표준 암호 PDF이고,
+  텍스트 레이어가 복사방지용으로 스크램블되어 있습니다(2026-08-26 실제 파일로 확인).
+  그래서 BC와 같은 이미지 렌더링 경로(`_decrypt_pdf_to_page_images()`)를 그대로
+  재사용합니다(`decrypt_shinhan_pdf()`).
 - **현대카드 HTML**: 파일 자체에는 암호화 로직이 없고, `https://www.hyundaicard.com/.../email_new.js`
   라는 **외부 스크립트**가 실제 복호화(`doAction()`)를 수행합니다. 이 파일은 인터넷에
   연결된 실제 브라우저 안에서만 열 수 있어 **헤드리스 브라우저(Playwright)가 필수**입니다.
@@ -41,43 +61,65 @@ BC바로카드(암호 PDF) / 현대카드(보안 HTML) / 삼성카드(보안 HTM
     클릭 전에도 이미 전체 텍스트를 반환하는 것으로 실측 확인됐지만(클릭 전/후
     텍스트 길이 동일), `main.py`는 카드사가 구현을 `display:none` 방식으로 바꾸는
     경우에 대비해 `a.detailView` 토글을 방어적으로 전부 클릭한 뒤 추출합니다.
+  - 현대카드는 다른 카드사와 **결제일 기준이 겹쳐 이중 계상되는 경우**가 있어,
+    **전체 합계(전체 합계 행)에서는 제외**합니다(`GRAND_TOTAL_EXCLUDED_CARDS`).
+    카드사별 소계(현대카드 소계)에는 그대로 반영됩니다.
+- **삼성카드 HTML**: 보안 HTML이지만 현대카드와 달리 **진짜 표시형 비밀번호 입력칸**
+  (`#password`, `type="password"`)과 제출 버튼(`#confirm`)을 그대로 씁니다 — 위장
+  입력칸이 없습니다(2026-08-25 실제 파일로 확인). Playwright로 그대로 채워서 제출합니다.
+  - 비밀번호가 틀리면 JS `alert("비밀번호 입력이 잘못되었습니다.")`가 뜨는데, `main.py`는
+    이 다이얼로그를 감지해서 실패로 처리합니다.
+  - 거래 목록에 **진짜 페이지네이션**("더보기 (현재페이지 X/전체페이지 Y)")이 있고,
+    현대카드와 달리 **클릭 전에는 실제로 데이터가 DOM에 없습니다**(총 17건인데 첫
+    클릭 전엔 10건만 존재, 실측 확인). 그래서 마지막 페이지까지 반복 클릭이 필수입니다.
+  - 복호화 과정에서 `samsungcard.com` 쪽으로 실제 네트워크 요청이 발생합니다(정적
+    리소스 CORS 에러가 일부 나지만 본문 복호화 자체는 성공). Cloud Run처럼 일반
+    인터넷 접근이 되는 환경이면 문제없습니다.
 - **파싱 엔진**: 원래 Gemini API로 구현했으나, Gemini와 Claude API를 **둘 다 코드에
   유지**하고 `PARSER_ENGINE` 환경변수(`claude` 또는 `gemini`, 기본값 `claude`)로
   전환할 수 있게 만들어뒀습니다. 자세한 내용은 아래 "1단계" 참고.
-- **BC바로카드 — PDF 또는 엑셀**: BC바로카드 명세서는 PDF뿐 아니라 엑셀(`.xlsx`/`.xls`)
-  로도 올 수 있어서, 첨부파일 확장자로 자동 판별해 처리합니다(`main.py`의
-  `decrypt_bc_excel()`). PDF와 달리 엑셀 셀 값은 폰트 스크램블 문제가 없어 이미지
-  렌더링 없이 셀 값을 텍스트로 바로 추출해 AI에 넘깁니다. 엑셀도 PDF처럼 비밀번호로
-  암호화되어 있는 것이 일반적이라(`msoffcrypto-tool`로 복호화) 같은
-  `BC_PDF_PASSWORD`를 그대로 사용합니다. **다만 아직 실제 BC 엑셀 샘플 파일로
-  검증하지 못했으니**, 실제 파일을 받으면 `python test_local.py bc 실제파일.xlsx`로
-  먼저 로컬 검증을 권장합니다.
+  - AI가 아주 드물게(2026-08-27 실측, 4번 중 1번꼴) 요청한 스키마(거래 = 객체 배열)를
+    벗어나 **`transactions`를 문자열 하나로 반환**하는 경우가 있어, `main.py`는 형태를
+    검증해서 최대 3회 자동 재시도하고, 그래도 실패하면 원인을 알 수 있는 메시지로
+    에러를 냅니다(`parse_transactions_with_claude` / `_validate_transactions`).
+- **시트 일자 셀 버그**: Sheets에 `USER_ENTERED`로 `"2026-01-01"` 같은 문자열을 쓰면
+  "사용자가 직접 입력한 것"처럼 스마트 파싱돼 **날짜 일련번호(예: 46023)로 바뀌어**
+  다시 읽으면 숫자로 돌아오는 문제가 있었습니다. 지금은 소계/합계를 다시 쓸 때
+  일자 열을 `TEXT` 서식으로 명시하고, 이미 숫자로 바뀐 값은 다시 날짜 문자열로
+  되돌립니다(`_normalize_date_cell_value`). 중복 판정 키도 이 정규화를 거칩니다.
+- **개인 사용내역 제외**: 시트에 남기고 싶지 않은 거래(가맹점명에 특정 문자열이
+  들어간 건)는 `main.py`의 `EXCLUDED_MERCHANT_SUBSTRINGS`에 넣으면 파싱은 하되 시트
+  기록 단계에서 건너뜁니다.
 
 ## 폴더 구성
 
 ```
 cloud_run/
-  main.py             복호화(BC: PDF는 이미지 렌더링, 엑셀은 텍스트 추출 / 현대카드: 텍스트 추출)
+  main.py             복호화(BC/신한: PDF는 이미지 렌더링, BC 엑셀·현대·삼성: 텍스트 추출)
                       + AI 파싱(Claude 또는 Gemini, PARSER_ENGINE으로 전환)
-                      + Sheets 기록을 담당하는 Cloud Run 서비스
+                      + Sheets 기록(월별 탭 + 카드사별 소계/전체 합계)을 담당하는 Cloud Run 서비스
   requirements.txt
   Dockerfile
-  test_local.py       ← 배포 전 로컬 검증용 (아래 "테스트 방법" 참고)
+  test_local.py       ← 배포 전 로컬 검증용. 파일 하나로 복호화(+키 있으면 파싱까지) 확인
+  test_gmail_fetch.py ← 로컬에서 실제 Gmail(IMAP)까지 연결해 검색→복호화→파싱→시트 기록 전 과정 검증
+  test_sheets_write.py← 서비스 계정 Sheets 쓰기 + 파일명 기반 월별 탭 생성 검증(일회성)
   .env                ← 로컬 테스트용 실제 값 (git에 올리지 말 것, .gitignore에 포함됨)
   .env.example        ← .env 템플릿 (실제 값 없음, 이 파일은 공유해도 무방)
 apps_script/          Gmail 감지 + Cloud Run 호출을 담당하는 Apps Script
   Code.gs
   appsscript.json
+SOURCE_REVIEW.md      소스 코드 상세 설명 (아키텍처 / 함수 단위 워크스루 / 알려진 리스크)
 ```
 
 ## 테스트 방법 (0단계 — 배포 전 로컬 검증, 강력 권장)
 
 GCP 배포 전에 `test_local.py`로 복호화 + (키가 있으면) AI 파싱까지 먼저 확인합니다.
-이 스크립트는 **BC바로카드와 현대카드를 각각 따로** 테스트하며, 두 단계로 동작합니다:
+이 스크립트는 **카드사별로 따로** 테스트하며, 두 단계로 동작합니다:
 
-1. 항상 실행됨 — 파일을 실제 비밀번호로 복호화. BC카드는 각 페이지를
-   `bc_page_1.png`, `bc_page_2.png`, ... 로 저장하고(직접 열어서 가맹점명이 잘
-   보이는지 눈으로 확인 가능), 현대카드는 추출된 텍스트 앞부분을 화면에 출력합니다.
+1. 항상 실행됨 — 파일을 실제 비밀번호로 복호화. BC바로카드·신한카드(PDF)는 각
+   페이지를 `bc_page_1.png` / `shinhan_page_1.png` … 로 저장하고(직접 열어서
+   가맹점명이 잘 보이는지 눈으로 확인 가능), BC 엑셀·현대카드·삼성카드는 추출된
+   텍스트 앞부분을 화면에 출력합니다.
 2. 조건부 실행 — `.env`(또는 환경변수)에 현재 `PARSER_ENGINE`에 맞는 API 키가
    있으면, 이어서 AI 파싱까지 자동 실행해서 거래 목록(일자/가맹점/금액/분류)을
    화면에 출력합니다. 키가 없으면 1번까지만 하고 안내 메시지를 보여줍니다.
@@ -102,23 +144,39 @@ ANTHROPIC_API_KEY=
 # PARSER_ENGINE=gemini일 때 사용 (발급: https://aistudio.google.com/apikey)
 GEMINI_API_KEY=
 
-# 두 카드사 명세서를 열 때 쓰는 비밀번호 (생년월일 6자리 등)
+# 각 카드사 명세서를 열 때 쓰는 비밀번호 (생년월일 6자리 등)
 BC_CARD_PASSWORD=
 HYUNDAI_CARD_PASSWORD=
+SAMSUNG_CARD_PASSWORD=
+SHINHAN_CARD_PASSWORD=
 ```
+
+> **비밀번호 환경변수 이름이 두 벌인 이유**: 로컬 테스트 스크립트(`.env`)는
+> `BC_CARD_PASSWORD` / `HYUNDAI_CARD_PASSWORD` / `SAMSUNG_CARD_PASSWORD` /
+> `SHINHAN_CARD_PASSWORD`를 쓰고, 운영용 Apps Script 스크립트 속성은
+> `BC_PDF_PASSWORD` / `HYUNDAI_HTML_PASSWORD` / `SAMSUNG_HTML_PASSWORD` /
+> `SHINHAN_PDF_PASSWORD`를 씁니다(4단계 표 참고). 값은 같고 이름만 다릅니다 — Cloud
+> Run(`main.py`)은 비밀번호를 저장하지 않고 매 요청 payload로 받으므로 이 이름들과
+> 무관합니다.
 
 ### 실행
 
 ```bash
-# BC바로카드 (.env의 BC_CARD_PASSWORD 사용)
+# BC바로카드 (.env의 BC_CARD_PASSWORD 사용) — PDF 또는 엑셀(확장자로 자동 판별)
 python test_local.py bc "실제BC명세서.pdf"
+python test_local.py bc "실제BC명세서.xlsx"
+
+# 신한카드 (.env의 SHINHAN_CARD_PASSWORD 사용)
+python test_local.py shinhan "실제신한명세서.pdf"
 
 # 현대카드 (.env의 HYUNDAI_CARD_PASSWORD 사용)
 python test_local.py hyundai "실제현대명세서.html"
 
+# 삼성카드 (.env의 SAMSUNG_CARD_PASSWORD 사용)
+python test_local.py samsung "실제삼성명세서.html"
+
 # 비밀번호를 .env 대신 그때그때 직접 넘기고 싶으면 세 번째 인자로 지정 가능
 python test_local.py bc "실제BC명세서.pdf" "생년월일6자리"
-python test_local.py hyundai "실제현대명세서.html" "비밀번호"
 ```
 
 `ANTHROPIC_API_KEY`(또는 `PARSER_ENGINE=gemini`일 땐 `GEMINI_API_KEY`)가 채워져
@@ -136,6 +194,26 @@ python test_local.py hyundai "실제현대명세서.html" "비밀번호"
 합계가 실제 명세서 총액과 맞는지, (3) `분류` 컬럼이 대체로 합리적인지. 분류가
 자꾸 이상하게 나오면 `main.py`의 `CATEGORY_CHOICES`나 `_build_parse_instruction()`의
 프롬프트를 다듬으세요.
+
+### (선택) 실제 Gmail까지 연결해 통합 검증 — `test_gmail_fetch.py`
+
+`test_local.py`가 "파일 하나"를 검증한다면, `test_gmail_fetch.py`는 **실제 메일함에서
+Code.gs와 같은 조건으로 검색 → 첨부 추출 → 복호화 → 파싱 → 시트 기록**까지 로컬에서
+그대로 돌려봅니다(운영 흐름의 리허설). Apps Script의 GmailApp 대신 IMAP + 앱
+비밀번호를 쓰므로 `.env`에 아래 값이 추가로 필요합니다.
+
+```dotenv
+GMAIL_ADDRESS=명세서를_받는_Gmail주소
+# 로그인 비밀번호 아님. 2단계 인증을 켠 뒤 https://myaccount.google.com/apppasswords 에서 발급하는 16자리
+GMAIL_APP_PASSWORD=
+# 시트 기록까지 확인하려면 아래 두 개도 필요 (3단계에서 만드는 값과 동일)
+SHEETS_SERVICE_ACCOUNT_JSON=
+SHEET_ID=
+```
+
+```bash
+python test_gmail_fetch.py
+```
 
 > Windows에서는 `pip`/`playwright`를 명령어로 바로 치는 대신 위처럼
 > `python -m pip ...` / `python -m playwright ...` 형태로 실행하는 것을 권장합니다.
@@ -185,7 +263,7 @@ python -c "import sys, platform; print(sys.version); print(sys.implementation.ca
 
 [python.org](https://www.python.org/downloads/)에서 Python 3.12를 추가 설치한 뒤, 이
 프로젝트 전용 가상환경을 3.12로 만드세요. 3.12는 사실상 모든 패키지의 wheel이 갖춰져
-있어 이런 문제 자체가 생기지 않습니다.
+있어 이런 문제 자체가 생기지 않습니다(Cloud Run 컨테이너도 `python:3.12-slim` 기준).
 
 ```powershell
 py -3.12 -m venv venv
@@ -194,11 +272,11 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-현대카드 테스트가 "복호화 결과가 비어 있습니다" 오류를 내면, `main.py`의
-`decrypt_hyundai_html()`에서 버튼 선택자(`input[type="image"].w_section`)나 팝업 감지
-로직을 실제 동작에 맞게 수정해야 합니다(카드사가 페이지 구조를 바꾼 경우). 실패 시
-`cloud_run/` 폴더에 `hyundai_debug_failure.png` 스크린샷이 자동으로 남으니 먼저 그걸
-열어보세요. 화면을 직접 보면서 디버깅하려면:
+현대카드/삼성카드 테스트가 "복호화 결과가 비어 있습니다" 오류를 내면, `main.py`의
+`decrypt_hyundai_html()` / `decrypt_samsung_html()`에서 버튼 선택자나 팝업/다이얼로그
+감지 로직을 실제 동작에 맞게 수정해야 합니다(카드사가 페이지 구조를 바꾼 경우).
+현대카드는 실패 시 `cloud_run/` 폴더에 `hyundai_debug_failure.png` 스크린샷이 자동으로
+남으니 먼저 그걸 열어보세요. 화면을 직접 보면서 디버깅하려면:
 
 ```bash
 # Windows PowerShell
@@ -208,8 +286,8 @@ $env:DEBUG_HEADED="1"; python test_local.py hyundai 실제파일.html 실제비�
 DEBUG_HEADED=1 python3 test_local.py hyundai 실제파일.html 실제비밀번호
 ```
 
-**알려진 이슈 — "element is not visible" 오류**: 이 사이트는 실제 비밀번호 입력칸
-(`#password`)을 `display:none`으로 숨겨두고, 화면에는 안내문구가 적힌 가짜 입력칸
+**알려진 이슈 — 현대카드 "element is not visible" 오류**: 이 사이트는 실제 비밀번호
+입력칸(`#password`)을 `display:none`으로 숨겨두고, 화면에는 안내문구가 적힌 가짜 입력칸
 (`name="p2_temp"`)만 보여줍니다. `main.py`는 이를 감안해 가짜 입력칸을 먼저 클릭한 뒤
 JS로 값을 직접 주입하도록 되어 있습니다 — 그래도 같은 오류가 나면 카드사가 페이지
 구조를 바꾼 것이니, `DEBUG_HEADED=1`로 화면을 보면서 실제 입력 요소를 다시 찾아
@@ -237,7 +315,10 @@ Cloud Run 환경변수의 `PARSER_ENGINE` 값(`claude` 또는 `gemini`, 기본�
 1. https://aistudio.google.com/apikey 접속 (Google 계정 로그인, 카드 등록 불필요)
 2. API 키 생성 → 아래 `GEMINI_API_KEY`로 사용, `.env`/Cloud Run에 `PARSER_ENGINE=gemini` 설정
 
-> **참고**: "비용 0원" 목표를 그대로 지키고 싶다면 이 옵션을 쓰세요.
+> **참고**: "비용 0원" 목표를 그대로 지키고 싶다면 이 옵션을 쓰세요. 단
+> `generativelanguage.googleapis.com`은 Claude Code(Cowork) 세션의 네트워크 허용목록에
+> 없어 **세션 안에서는 Gemini 파싱 테스트가 403으로 막힙니다** — 사용자 본인 PC나
+> Cloud Run에서는 정상 동작합니다.
 
 ## 2단계 — Google Cloud 프로젝트 + 서비스 계정
 
@@ -328,10 +409,11 @@ gcloud run deploy card-automation \
    |---|---|
    | `CLOUD_RUN_URL` | 3단계에서 받은 Cloud Run URL |
    | `SHARED_SECRET` | 3단계에서 생성한 값과 동일하게 |
-   | `BC_PDF_PASSWORD` | BC바로카드 PDF 비밀번호 |
+   | `BC_PDF_PASSWORD` | BC바로카드 PDF/엑셀 비밀번호 |
    | `HYUNDAI_HTML_PASSWORD` | 현대카드 보안메일 비밀번호 |
    | `SAMSUNG_HTML_PASSWORD` | 삼성카드 보안메일 비밀번호 |
    | `SHINHAN_PDF_PASSWORD` | 신한카드 PDF 비밀번호 |
+   | `PROCESSED_LABEL` | (선택) 기본값 `정산완료` — 없으면 자동 생성 |
 
 4. 함수 목록에서 `createTimeTrigger`를 선택해 **1회 수동 실행** → Gmail 권한 승인 팝업이
    뜨면 허용 (이때 **매일 1회(기본 오전 8시경) 트리거**가 설치됩니다. 실행 시각을 바꾸고
@@ -340,6 +422,21 @@ gcloud run deploy card-automation \
    기존 트리거는 자동으로 지우고 새로 설치합니다)
 5. 실행 > 로그에서 정상 동작 확인, 또는 `checkNewStatements`를 수동 실행해 즉시 테스트
 
+### Apps Script가 메일을 찾는 조건
+
+카드사별로 Gmail 검색을 따로 돌립니다(`Code.gs`의 `runCheck_`):
+
+| 카드 | 검색 쿼리 | 허용 첨부 확장자 |
+|---|---|---|
+| BC바로카드 | `in:inbox subject:BC바로카드 subject:명세서` | `.pdf` `.xlsx` `.xls` |
+| 현대카드 | `in:inbox subject:현대카드 subject:명세서` | `.html` `.htm` |
+| 삼성카드 | `in:inbox subject:삼성카드 subject:명세서` | `.html` `.htm` |
+| 신한카드 | `in:inbox subject:신한카드 subject:명세서` | `.pdf` |
+
+`in:inbox`라서 받은편지함에 있는 메일만 대상입니다(보관/스팸/휴지통 제외). 평소
+실행(`checkNewStatements`)은 여기에 ` -label:정산완료`가 더 붙어 이미 처리한 메일을
+건너뜁니다.
+
 ## 중복 방지 + 수동 강제 업데이트
 
 카드사 명세서는 보통 한 달에 한 번만 오지만, 트리거는 매일 실행됩니다. 정상적인
@@ -347,28 +444,52 @@ gcloud run deploy card-automation \
 명세서를 또 처리하지 않지만, 라벨이 무슨 이유로든 안 붙는 경우(부분 실패 등)를
 대비해 Cloud Run(`main.py`) 쪽에도 안전장치를 넣었습니다: 시트에 **(카드명, 일자,
 가맹점, 금액)이 이미 존재하는 거래는 자동으로 건너뜁니다.** 그래서 같은 메일이
-두 번 처리되어도 시트에 중복 행이 쌓이지 않습니다.
+두 번 처리되어도 시트에 중복 행이 쌓이지 않습니다(같은 요청 안의 중복도 함께 막습니다).
 
 이 덕분에 **수동 강제 업데이트**도 안전하게 할 수 있습니다 — Apps Script 편집기에서
 `forceReprocessAll` 함수를 선택해 수동 실행하면, 라벨이 이미 붙은 메일까지 포함해
 최근 명세서를 전부 다시 처리합니다. 이미 시트에 기록된 거래는 자동으로 건너뛰고
 누락되었던 거래만 새로 추가되므로, 아래와 같은 상황에서 쓰면 됩니다.
 
-- 현대카드 뷰어 구조 변경 등으로 일부 첨부파일만 처리 실패했을 때, 원인을 고친 뒤 재확인
+- 현대카드/삼성카드 뷰어 구조 변경 등으로 일부 첨부파일만 처리 실패했을 때, 원인을 고친 뒤 재확인
 - `main.py`의 파싱/분류 프롬프트를 수정한 뒤 최근 명세서로 다시 검증하고 싶을 때
 - 매일 트리거를 기다리지 않고 지금 바로 반영하고 싶을 때
 
+## 시트에 기록되는 방식
+
+- **월별 탭**: 첨부파일명에서 `YYYYMMDD`(8자리, 예: `BC바로카드_20260813.pdf`) 또는
+  `YYYYMM`(6자리, 예: `hyundaicard_202606.html`) 형식의 날짜를 찾아 `YYYYMM` 탭에
+  기록합니다. 탭이 없으면 헤더(`카드명 | 일자 | 가맹점 | 금액 | 분류`)와 함께 자동
+  생성합니다. 파일명에 날짜가 없으면 `SHEET_TAB`(기본 `시트1`)로 폴백합니다.
+- **카드사별 소계 + 전체 합계**: 명세서가 새로 처리될 때마다 순수 거래 행만 다시
+  모아 카드사별로 그룹핑하고, 각 그룹 끝에 `<카드명> 소계` 행(연한 파랑), 맨 끝에
+  `전체 합계` 행(금색 + 굵게)을 다시 씁니다. 여러 번 실행해도 항상 같은 결과가
+  나오도록(멱등적) 기존 소계/합계 행은 먼저 걷어내고 재계산합니다. `현대카드`는
+  전체 합계에서만 제외됩니다(`GRAND_TOTAL_EXCLUDED_CARDS`).
+- **금액 서식**: 금액 열은 통화 서식(`#,##0"원"`), 나머지 열은 `TEXT` 서식으로
+  고정해서 Sheets의 스마트 파싱이 일자를 날짜 일련번호로 바꾸지 못하게 합니다.
+- **개인 사용내역 제외**: `EXCLUDED_MERCHANT_SUBSTRINGS`에 포함된 문자열이 가맹점명에
+  들어간 거래는 시트에 기록하지 않습니다.
+
 ## 알아둘 점 / 남은 리스크
 
-- **현대카드 자동화의 안정성**: 카드사가 보안메일 뷰어 페이지 구조를 바꾸면 조용히
-  실패할 수 있습니다. `notifyFailure_()`가 실패 시 본인 메일로 알림을 보내도록 이미
-  넣어뒀지만, 가끔 한 번씩 Apps Script 실행 로그를 확인하는 습관을 권장합니다.
-- **비밀번호 저장 위치**: 두 카드 비밀번호는 Apps Script 스크립트 속성과 Cloud Run
+- **현대카드·삼성카드 자동화의 안정성**: 카드사가 보안메일 뷰어 페이지 구조를 바꾸면
+  조용히 실패할 수 있습니다. `notifyFailure_()`가 실패 시 본인 메일로 알림을 보내도록
+  이미 넣어뒀지만, 가끔 한 번씩 Apps Script 실행 로그를 확인하는 습관을 권장합니다.
+  삼성카드는 특히 페이지네이션(더보기)을 끝까지 못 누르면 거래가 조용히 누락될 수
+  있으니, 처음 몇 번은 시트 건수와 실제 명세서 건수를 대조하세요.
+- **BC 엑셀 경로는 미검증**: `decrypt_bc_excel()`은 실제 BC바로카드 엑셀 샘플로 아직
+  검증되지 않았습니다. 실제 파일을 받으면 `python test_local.py bc 실제파일.xlsx`로
+  먼저 확인하고, 셀 레이아웃에 따라 프롬프트를 다듬어야 할 수 있습니다.
+- **비밀번호 저장 위치**: 카드 비밀번호는 Apps Script 스크립트 속성과 Cloud Run
   환경변수, 두 곳에 평문으로 저장됩니다. 개인 계정 안에서만 접근 가능한 저장소이긴
   하지만, 더 엄격하게 하려면 Cloud Run 쪽 값은 Secret Manager로 옮길 수 있습니다.
 - **분류 정확도**: `분류` 컬럼은 가맹점명만 보고 AI(현재 설정된 `PARSER_ENGINE`)가
   추론합니다. 처음 몇 번은 결과를 검토하고, 필요하면 `main.py`의 `CATEGORY_CHOICES`나
   프롬프트(`_build_parse_instruction`)를 다듬으세요.
+- **AI 응답이 스키마를 벗어나는 경우**: 드물게 `transactions`가 객체 배열이 아니라
+  문자열로 오는 것이 실측되어, `main.py`는 최대 3회 재시도 후 명확한 에러를 냅니다.
+  이 에러가 나면 잠시 후 `forceReprocessAll`로 재시도하면 대부분 해결됩니다.
 - **파싱 엔진(Claude/Gemini) 전환**: `main.py`에 두 엔진 코드가 모두 남아있으니,
   `.env`나 Cloud Run 환경변수의 `PARSER_ENGINE`만 `claude` ↔ `gemini`로 바꾸면 됩니다.
   코드를 다시 배포할 필요는 없고(Cloud Run은 `gcloud run services update --update-env-vars`),
