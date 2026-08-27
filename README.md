@@ -44,12 +44,20 @@ BC바로카드(암호 PDF) / 현대카드(보안 HTML) / 삼성카드(보안 HTM
 - **파싱 엔진**: 원래 Gemini API로 구현했으나, Gemini와 Claude API를 **둘 다 코드에
   유지**하고 `PARSER_ENGINE` 환경변수(`claude` 또는 `gemini`, 기본값 `claude`)로
   전환할 수 있게 만들어뒀습니다. 자세한 내용은 아래 "1단계" 참고.
+- **BC바로카드 — PDF 또는 엑셀**: BC바로카드 명세서는 PDF뿐 아니라 엑셀(`.xlsx`/`.xls`)
+  로도 올 수 있어서, 첨부파일 확장자로 자동 판별해 처리합니다(`main.py`의
+  `decrypt_bc_excel()`). PDF와 달리 엑셀 셀 값은 폰트 스크램블 문제가 없어 이미지
+  렌더링 없이 셀 값을 텍스트로 바로 추출해 AI에 넘깁니다. 엑셀도 PDF처럼 비밀번호로
+  암호화되어 있는 것이 일반적이라(`msoffcrypto-tool`로 복호화) 같은
+  `BC_PDF_PASSWORD`를 그대로 사용합니다. **다만 아직 실제 BC 엑셀 샘플 파일로
+  검증하지 못했으니**, 실제 파일을 받으면 `python test_local.py bc 실제파일.xlsx`로
+  먼저 로컬 검증을 권장합니다.
 
 ## 폴더 구성
 
 ```
 cloud_run/
-  main.py             복호화(BC: 이미지 렌더링 / 현대카드: 텍스트 추출)
+  main.py             복호화(BC: PDF는 이미지 렌더링, 엑셀은 텍스트 추출 / 현대카드: 텍스트 추출)
                       + AI 파싱(Claude 또는 Gemini, PARSER_ENGINE으로 전환)
                       + Sheets 기록을 담당하는 Cloud Run 서비스
   requirements.txt

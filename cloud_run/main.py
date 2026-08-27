@@ -170,6 +170,76 @@ def decrypt_bc_pdf(pdf_bytes: bytes, password: str) -> list[bytes]:
     return _decrypt_pdf_to_page_images(pdf_bytes, password)
 
 
+# ---------------------------------------------------------------------------
+# 1-B. BC바로카드 — 암호 엑셀(xlsx/xls) 복호화 → 텍스트 추출
+# ---------------------------------------------------------------------------
+def decrypt_bc_excel(file_bytes: bytes, password: str) -> str:
+    """BC바로카드 명세서가 PDF 대신 엑셀로 오는 경우. PDF와 마찬가지로 생년월일 등
+    비밀번호로 암호화된 MS Office 파일인 것이 일반적이라 msoffcrypto-tool로 먼저
+    복호화를 시도하고, 암호화되어 있지 않으면 원본을 그대로 읽습니다.
+
+    PDF와 달리 엑셀 셀 값은 폰트 스크램블(복사방지) 문제가 없으므로 이미지 렌더링
+    없이 셀 값을 그대로 텍스트로 뽑아 AI 텍스트 파싱 경로(raw_text)로 넘깁니다.
+
+    주의: 아직 실제 BC바로카드 엑셀 샘플 파일로 검증되지 않았습니다. 실제 파일을
+    받으면 `python test_local.py bc 실제파일.xlsx`로 먼저 로컬 검증을 권장합니다
+    (README "테스트 방법" 참고). 신형(.xlsx, OOXML)과 구형(.xls, BIFF8) 포맷을 모두
+    시도하도록 만들어뒀지만, 실제 파일의 셀 레이아웃(표 구조)에 따라
+    `_build_parse_instruction()`의 프롬프트를 다듬어야 할 수 있습니다.
+    """
+    import msoffcrypto
+
+    src = io.BytesIO(file_bytes)
+    decrypted = io.BytesIO()
+
+    try:
+        office_file = msoffcrypto.OfficeFile(src)
+        is_encrypted = office_file.is_encrypted()
+    except Exception:
+        # msoffcrypto가 인식 못하는 포맷이면 암호화되지 않은 파일로 간주하고 원본 사용
+        is_encrypted = False
+
+    if is_encrypted:
+        try:
+            office_file.load_key(password=password)
+            office_file.decrypt(decrypted)
+        except Exception as exc:
+            raise ValueError(f"엑셀 비밀번호가 올바르지 않거나 복호화에 실패했습니다: {exc}") from exc
+        decrypted.seek(0)
+    else:
+        decrypted = io.BytesIO(file_bytes)
+
+    lines: list[str] = []
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(decrypted, data_only=True)
+        for ws in wb.worksheets:
+            lines.append(f"[시트: {ws.title}]")
+            for row in ws.iter_rows(values_only=True):
+                if all(cell is None for cell in row):
+                    continue
+                lines.append("\t".join("" if c is None else str(c) for c in row))
+    except Exception:
+        # 신형(.xlsx) 파서로 못 열면 구형(.xls, BIFF8) 포맷일 수 있으니 xlrd로 재시도
+        decrypted.seek(0)
+        import xlrd
+
+        wb = xlrd.open_workbook(file_contents=decrypted.read())
+        for sheet in wb.sheets():
+            lines.append(f"[시트: {sheet.name}]")
+            for row_idx in range(sheet.nrows):
+                row = sheet.row_values(row_idx)
+                if all(c == "" for c in row):
+                    continue
+                lines.append("\t".join(str(c) for c in row))
+
+    text = "\n".join(lines)
+    if not text.strip():
+        raise ValueError("엑셀에서 읽은 내용이 비어 있습니다.")
+    return text
+
+
 def decrypt_shinhan_pdf(pdf_bytes: bytes, password: str) -> list[bytes]:
     """신한카드 명세서 PDF. BC바로카드와 동일하게 폰트 스크램블이 확인되어(2026-08-26)
     같은 이미지 렌더링 방식을 그대로 사용합니다."""
@@ -726,8 +796,13 @@ def process():
 
     try:
         if card_type == "BC":
-            page_images = decrypt_bc_pdf(file_bytes, password)
-            transactions = parse_transactions(card_name, page_images=page_images)
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in (".xlsx", ".xls"):
+                raw_text = decrypt_bc_excel(file_bytes, password)
+                transactions = parse_transactions(card_name, raw_text=raw_text)
+            else:  # .pdf (기본값)
+                page_images = decrypt_bc_pdf(file_bytes, password)
+                transactions = parse_transactions(card_name, page_images=page_images)
         elif card_type == "SHINHAN":
             page_images = decrypt_shinhan_pdf(file_bytes, password)
             transactions = parse_transactions(card_name, page_images=page_images)

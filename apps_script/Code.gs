@@ -22,8 +22,14 @@
  *   PROCESSED_LABEL        기본값 "정산완료" (없으면 자동 생성)
  */
 
-// PDF 첨부(BC, 신한)인 카드사 목록 — 나머지(현대, 삼성)는 보안 HTML.
-const PDF_CARD_TYPES = ['BC', 'SHINHAN'];
+// 카드사별로 허용하는 첨부파일 확장자.
+// BC바로카드는 명세서가 PDF 또는 엑셀(xlsx/xls) 둘 중 하나로 올 수 있어 둘 다 허용.
+const ACCEPTED_EXTENSIONS = {
+  BC: ['.pdf', '.xlsx', '.xls'],
+  SHINHAN: ['.pdf'],
+  HYUNDAI: ['.html', '.htm'],
+  SAMSUNG: ['.html', '.htm'],
+};
 
 function getConfig_() {
   const p = PropertiesService.getScriptProperties();
@@ -57,12 +63,15 @@ function runCheck_(includeAlreadyLabeled) {
   const label = getOrCreateLabel_(cfg.labelName);
   const exclude = includeAlreadyLabeled ? '' : (' -label:' + cfg.labelName);
 
-  // 카드사별로 따로 검색 — 제목 조건이 다르고, card_type을 바로 알 수 있음
+  // 카드사별로 따로 검색 — 제목 조건이 다르고, card_type을 바로 알 수 있음.
+  // in:inbox — 받은편지함에 있는 메일만 대상으로 함(보관된 메일이나 다른 라벨의
+  // 메일은 제외). 스팸함/휴지통은 in: 조건과 무관하게 GmailApp.search()가 기본적으로
+  // 검색 대상에서 제외하므로 별도 조건 없이도 이미 안전함.
   const searches = [
-    { cardType: 'BC', query: 'subject:BC바로카드 subject:명세서' + exclude },
-    { cardType: 'HYUNDAI', query: 'subject:현대카드 subject:명세서' + exclude },
-    { cardType: 'SAMSUNG', query: 'subject:삼성카드 subject:명세서' + exclude },
-    { cardType: 'SHINHAN', query: 'subject:신한카드 subject:명세서' + exclude },
+    { cardType: 'BC', query: 'in:inbox subject:BC바로카드 subject:명세서' + exclude },
+    { cardType: 'HYUNDAI', query: 'in:inbox subject:현대카드 subject:명세서' + exclude },
+    { cardType: 'SAMSUNG', query: 'in:inbox subject:삼성카드 subject:명세서' + exclude },
+    { cardType: 'SHINHAN', query: 'in:inbox subject:신한카드 subject:명세서' + exclude },
   ];
 
   searches.forEach(function (s) {
@@ -86,11 +95,10 @@ function processThread_(thread, cardType, cfg, label) {
 
     attachments.forEach(function (attachment) {
       const name = attachment.getName().toLowerCase();
-      const isPdf = name.endsWith('.pdf');
-      const isHtml = name.endsWith('.html') || name.endsWith('.htm');
-      const expectsPdf = PDF_CARD_TYPES.indexOf(cardType) !== -1;
+      const accepted = ACCEPTED_EXTENSIONS[cardType] || [];
+      const matches = accepted.some(function (ext) { return name.endsWith(ext); });
 
-      if ((expectsPdf && !isPdf) || (!expectsPdf && !isHtml)) {
+      if (!matches) {
         return; // 이 카드사에서 기대하는 첨부 형식이 아니면 건너뜀
       }
 

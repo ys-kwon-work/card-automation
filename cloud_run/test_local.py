@@ -21,15 +21,20 @@ GCP/Apps Script 세팅 없이, 실제 파일 + 실제 비밀번호로 복호화(
 사용법:
   python3 test_local.py bc "실제BC명세서.pdf"                 # .env의 비밀번호 사용
   python3 test_local.py bc "실제BC명세서.pdf" "생년월일6자리"    # 비밀번호 직접 지정
+  python3 test_local.py bc "실제BC명세서.xlsx"                # BC는 엑셀로도 올 수 있음(확장자로 자동 판별)
   python3 test_local.py hyundai "실제현대명세서.html"
   python3 test_local.py hyundai "실제현대명세서.html" "비밀번호"
   python3 test_local.py samsung "실제삼성명세서.html"
   python3 test_local.py shinhan "실제신한명세서.pdf"
 
-BC바로카드/신한카드는 텍스트 대신 페이지 이미지(PNG)를 생성합니다 — 이 두 카드사
-PDF는 복사/추출 방지를 위해 텍스트 레이어가 스크램블되어 있어(둘 다 실제 확인됨)
-이미지로 렌더링해서 비전 모델 입력으로 사용해야 하기 때문입니다. 생성된
+BC바로카드(PDF)/신한카드는 텍스트 대신 페이지 이미지(PNG)를 생성합니다 — 이 두
+카드사 PDF는 복사/추출 방지를 위해 텍스트 레이어가 스크램블되어 있어(둘 다 실제
+확인됨) 이미지로 렌더링해서 비전 모델 입력으로 사용해야 하기 때문입니다. 생성된
 {bc,shinhan}_page_N.png 파일을 직접 열어서 가맹점명이 잘 보이는지 확인하세요.
+
+BC바로카드가 엑셀(.xlsx/.xls)로 오는 경우는 셀 값에 스크램블 문제가 없으므로
+이미지 렌더링 없이 텍스트로 바로 추출합니다(아직 실제 샘플로 검증되지 않았으니
+실제 파일을 받으면 이 스크립트로 먼저 확인하세요).
 """
 
 import os
@@ -41,6 +46,7 @@ load_dotenv()
 
 from main import (
     decrypt_bc_pdf,
+    decrypt_bc_excel,
     decrypt_shinhan_pdf,
     decrypt_hyundai_html,
     decrypt_samsung_html,
@@ -67,6 +73,19 @@ def print_transactions(transactions: list[dict]) -> None:
         print(f"  {t.get('일자')}\t{t.get('가맹점')}\t{amount_str:>10}\t{t.get('분류')}")
 
 
+def _run_text_path(card_name: str, text: str, parser_ready: bool, engine_key_name: str) -> None:
+    print("=== 추출된 텍스트 (앞 1000자) ===")
+    print(text[:1000])
+    print("\n=== 총 길이:", len(text), "자 ===")
+
+    if parser_ready:
+        print(f"\n=== PARSER_ENGINE={PARSER_ENGINE} ({engine_key_name} 감지됨) → 파싱 실행 ===")
+        transactions = parse_transactions(card_name, raw_text=text)
+        print_transactions(transactions)
+    else:
+        print(f"\n(.env에 PARSER_ENGINE={PARSER_ENGINE}에 맞는 {engine_key_name}를 채우면 이어서 파싱까지 자동 실행됩니다.)")
+
+
 def main():
     if len(sys.argv) not in (3, 4):
         print(__doc__)
@@ -91,7 +110,14 @@ def main():
     engine_key_name = ENGINE_API_KEY.get(PARSER_ENGINE)
     parser_ready = bool(engine_key_name and os.environ.get(engine_key_name))
 
-    if card_type in PDF_CARD_TYPES:
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if card_type == "bc" and ext in (".xlsx", ".xls"):
+        # BC바로카드는 PDF 대신 엑셀로 올 수도 있음 — 확장자로 자동 판별
+        text = decrypt_bc_excel(file_bytes, password)
+        _run_text_path(card_name, text, parser_ready, engine_key_name)
+
+    elif card_type in PDF_CARD_TYPES:
         decrypt_fn = decrypt_bc_pdf if card_type == "bc" else decrypt_shinhan_pdf
         images = decrypt_fn(file_bytes, password)
         print(f"=== {card_name}: {len(images)}개 페이지를 이미지로 렌더링 완료 ===")
@@ -112,16 +138,7 @@ def main():
     else:  # hyundai, samsung
         decrypt_fn = decrypt_hyundai_html if card_type == "hyundai" else decrypt_samsung_html
         text = decrypt_fn(file_bytes, password)
-        print("=== 추출된 텍스트 (앞 1000자) ===")
-        print(text[:1000])
-        print("\n=== 총 길이:", len(text), "자 ===")
-
-        if parser_ready:
-            print(f"\n=== PARSER_ENGINE={PARSER_ENGINE} ({engine_key_name} 감지됨) → 파싱 실행 ===")
-            transactions = parse_transactions(card_name, raw_text=text)
-            print_transactions(transactions)
-        else:
-            print(f"\n(.env에 PARSER_ENGINE={PARSER_ENGINE}에 맞는 {engine_key_name}를 채우면 이어서 파싱까지 자동 실행됩니다.)")
+        _run_text_path(card_name, text, parser_ready, engine_key_name)
 
 
 if __name__ == "__main__":
