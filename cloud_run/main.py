@@ -51,6 +51,7 @@ import json
 import os
 import re
 import tempfile
+import traceback
 from datetime import date, timedelta
 
 from flask import Flask, request, jsonify
@@ -83,6 +84,12 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 SHEET_HEADERS = ["카드명", "일자", "가맹점", "금액", "분류"]
 CATEGORY_CHOICES = ["식비", "카페/간식", "교통", "쇼핑", "통신", "의료", "문화/여가", "주거/공과금", "기타"]
+
+# 가맹점명에 아래 문자열이 포함된 거래는 시트에 아예 기록하지 않음(사용자 요청).
+EXCLUDED_MERCHANT_SUBSTRINGS = ["모바일이즐 후불무승인", "KT통신요금자동납부-991613", "KCP-성남시청"]
+
+# 전체 합계(GRAND_TOTAL_LABEL)에서 제외할 카드명. 카드사별 소계에는 그대로 반영됨.
+GRAND_TOTAL_EXCLUDED_CARDS = {"현대카드"}
 
 TRANSACTION_SCHEMA = {
     "type": "object",
@@ -523,6 +530,8 @@ def append_rows_to_sheet(card_name: str, transactions: list[dict], filename: str
     rows: list[list] = []
     skipped = 0
     for t in transactions:
+        if any(sub in t["가맹점"] for sub in EXCLUDED_MERCHANT_SUBSTRINGS):
+            continue
         key = (card_name, t["일자"], t["가맹점"], _to_amount(t["금액"]))
         if key in existing_keys:
             skipped += 1
@@ -625,7 +634,9 @@ def apply_card_totals(service, spreadsheet_id: str, tab_name: str) -> None:
         new_rows.append([f"{card}{SUBTOTAL_SUFFIX}", "", "", card_sum, ""])
         subtotal_row_indices.append(len(new_rows) - 1)
 
-    grand_total = sum(_to_amount(r[3]) for r in transactions if len(r) > 3)
+    grand_total = sum(
+        _to_amount(r[3]) for r in transactions if len(r) > 3 and r[0] not in GRAND_TOTAL_EXCLUDED_CARDS
+    )
     new_rows.append([GRAND_TOTAL_LABEL, "", "", grand_total, ""])
     grand_total_row_index = len(new_rows) - 1
 
@@ -737,6 +748,7 @@ def process():
         })
 
     except Exception as exc:  # noqa: BLE001 — Apps Script가 실패를 보고 라벨을 걸지 않도록 전달
+        traceback.print_exc()  # Cloud Run 로그(Logs Explorer)에 전체 스택트레이스를 남김
         return jsonify({"status": "error", "message": str(exc)}), 500
 
 
