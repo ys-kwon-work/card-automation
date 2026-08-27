@@ -86,7 +86,7 @@ SHEET_HEADERS = ["카드명", "일자", "가맹점", "금액", "분류"]
 CATEGORY_CHOICES = ["식비", "카페/간식", "교통", "쇼핑", "통신", "의료", "문화/여가", "주거/공과금", "기타"]
 
 # 가맹점명에 아래 문자열이 포함된 거래는 시트에 아예 기록하지 않음(사용자 요청).
-EXCLUDED_MERCHANT_SUBSTRINGS = ["모바일이즐 후불무승인", "KT통신요금자동납부-991613", "KCP-성남시청"]
+EXCLUDED_MERCHANT_SUBSTRINGS = ["후불무승인_", "KT통신요금자동납부-991613", "KCP-성남시청"]
 
 # 전체 합계(GRAND_TOTAL_LABEL)에서 제외할 카드명. 카드사별 소계에는 그대로 반영됨.
 GRAND_TOTAL_EXCLUDED_CARDS = {"현대카드"}
