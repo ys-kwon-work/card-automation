@@ -80,7 +80,9 @@ PARSER_ENGINE = os.environ.get("PARSER_ENGINE", "claude").strip().lower()
 
 # 2026-08 기준 최신 모델 ID들. 필요하면 환경변수로 덮어쓸 수 있음.
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# gemini-2.5-flash는 신규 사용자에게 단종됨(2026-08-27 실제 API 호출로 확인 —
+# 404 NOT_FOUND, 응답에서 gemini-3.6-flash로 교체하라고 명시함).
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 SHEET_HEADERS = ["카드명", "일자", "가맹점", "금액", "분류"]
 CATEGORY_CHOICES = ["식비", "카페/간식", "교통", "쇼핑", "통신", "의료", "문화/여가", "주거/공과금", "기타"]
@@ -537,7 +539,7 @@ def parse_transactions_with_gemini(
 
     # Claude 쪽에서 실제로 관찰된 "transactions가 배열 대신 문자열로 오는" 문제에
     # 대한 방어로 여기도 동일하게 재시도 + 형태 검증을 적용함(Gemini는 서버가
-    # response_json_schema를 강제하므로 발생 확률은 낮지만, 만일을 대비).
+    # response_schema를 강제하므로 발생 확률은 낮지만, 만일을 대비).
     max_attempts = 3
     last_bad_value = None
     for attempt in range(1, max_attempts + 1):
@@ -546,7 +548,12 @@ def parse_transactions_with_gemini(
             contents=contents,
             config=genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_json_schema=TRANSACTION_SCHEMA,
+                # 주의: 필드명이 response_json_schema가 아니라 response_schema임
+                # (2026-08-27 실제 테스트로 확인 — google-genai==1.15.0 기준
+                # response_json_schema는 존재하지 않는 필드라 즉시 pydantic
+                # ValidationError가 남). response_schema는 우리가 쓰는 표준 JSON
+                # Schema 형태(dict)를 그대로 받아들이는 것까지 로컬 검증함.
+                response_schema=TRANSACTION_SCHEMA,
                 temperature=0,  # 표를 그대로 옮기는 작업이라 창의성이 불필요하고,
                 # 낮출수록 스키마를 벗어난 응답 확률이 줄어듦.
             ),
@@ -765,20 +772,37 @@ def apply_card_totals(service, spreadsheet_id: str, tab_name: str) -> None:
             order.append(card)
         groups[card].append(r)
 
+    # 금액(D열) 합계는 파이썬에서 계산한 고정값 대신 시트 수식(SUM)으로 써서,
+    # 나중에 사람이 시트에서 금액 셀을 직접 고치면 소계/전체 합계가 자동으로
+    # 다시 계산되도록 함. new_rows의 0번째 항목이 실제 시트에서는 2행(헤더 다음)
+    # 이므로, new_rows 인덱스 i는 항상 시트 행 번호 i+2에 대응함.
+    AMOUNT_COL = "D"
+
+    def _sheet_row(new_rows_index: int) -> int:
+        return new_rows_index + 2
+
     new_rows: list[list] = []
     subtotal_row_indices: list[int] = []
+    subtotal_cell_by_card: dict[str, str] = {}
     for card in order:
+        start_row = _sheet_row(len(new_rows))
         for r in groups[card]:
             padded = (r + ["", "", "", "", ""])[:5]
             new_rows.append(padded)
-        card_sum = sum(_to_amount(r[3]) for r in groups[card] if len(r) > 3)
-        new_rows.append([f"{card}{SUBTOTAL_SUFFIX}", "", "", card_sum, ""])
+        end_row = _sheet_row(len(new_rows) - 1)
+        subtotal_formula = f"=SUM({AMOUNT_COL}{start_row}:{AMOUNT_COL}{end_row})"
+        new_rows.append([f"{card}{SUBTOTAL_SUFFIX}", "", "", subtotal_formula, ""])
         subtotal_row_indices.append(len(new_rows) - 1)
+        subtotal_cell_by_card[card] = f"{AMOUNT_COL}{_sheet_row(len(new_rows) - 1)}"
 
-    grand_total = sum(
-        _to_amount(r[3]) for r in transactions if len(r) > 3 and r[0] not in GRAND_TOTAL_EXCLUDED_CARDS
-    )
-    new_rows.append([GRAND_TOTAL_LABEL, "", "", grand_total, ""])
+    # 전체 합계는 개인 사용내역 카드사(GRAND_TOTAL_EXCLUDED_CARDS)를 뺀 나머지
+    # 카드사 소계 셀들만 더하는 수식으로 만듦(소계 자체가 이미 수식이라 개별 거래
+    # 금액이 바뀌면 소계 → 전체 합계까지 자동으로 반영됨).
+    included_refs = [
+        subtotal_cell_by_card[card] for card in order if card not in GRAND_TOTAL_EXCLUDED_CARDS
+    ]
+    grand_total_formula = "=SUM(" + ",".join(included_refs) + ")" if included_refs else "=0"
+    new_rows.append([GRAND_TOTAL_LABEL, "", "", grand_total_formula, ""])
     grand_total_row_index = len(new_rows) - 1
 
     # 값(userEnteredValue)과 서식(numberFormat/배경색/굵게)을 한 번의 updateCells
@@ -797,7 +821,11 @@ def apply_card_totals(service, spreadsheet_id: str, tab_name: str) -> None:
     def _cell_data(value, col: int, row_extra: dict | None) -> dict:
         if col == 3:  # 금액
             cell_format = {"numberFormat": AMOUNT_NUMBER_FORMAT}
-            user_value = {"numberValue": _to_amount(value)}
+            if isinstance(value, str) and value.startswith("="):
+                # 소계/전체 합계 행 — SUM 수식을 그대로 셀에 입력(고정값이 아님)
+                user_value = {"formulaValue": value}
+            else:
+                user_value = {"numberValue": _to_amount(value)}
         else:
             # numberFormat을 TEXT로 명시해서 항상 원문 그대로 표시되게 함(안 그러면
             # Sheets가 "사용자가 입력한 값"으로 스마트 파싱해서 예를 들어 일자를 날짜
