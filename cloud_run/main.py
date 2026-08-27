@@ -461,19 +461,44 @@ def parse_transactions_with_claude(
         "input_schema": TRANSACTION_SCHEMA,
     }
 
-    response = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=4096,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "record_transactions"},
-        messages=[{"role": "user", "content": content}],
+    # 참고: temperature로 응답을 더 결정적으로 만들어보려 했으나, 현재 설치된
+    # anthropic SDK(1.0.0)의 messages.create()가 temperature 파라미터 자체를 받지
+    # 않음(실제 확인됨 — 전달 시 "unexpected keyword argument" TypeError 발생).
+    #
+    # 대신 재시도로 대응함: 아주 드물게(2026-08-27 실제 관찰, 4번 중 1번꼴)
+    # record_transactions의 "transactions" 입력값이 스키마(객체 배열)를 벗어나
+    # JSON 전체가 문자열 하나로 오는 경우가 있음 — 그대로 두면 호출부에서
+    # "string indices must be integers, not 'str'"처럼 원인을 알기 어려운 에러로
+    # 나타남. 같은 요청을 다시 보내면 대부분 정상으로 돌아오는 것으로 확인되어
+    # 최대 3회까지 자동 재시도한다.
+    max_attempts = 3
+    last_bad_value = None
+    for attempt in range(1, max_attempts + 1):
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=4096,
+            tools=[tool],
+            tool_choice={"type": "tool", "name": "record_transactions"},
+            messages=[{"role": "user", "content": content}],
+        )
+
+        transactions = None
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "record_transactions":
+                transactions = block.input.get("transactions", [])
+                break
+
+        if isinstance(transactions, list) and all(isinstance(t, dict) for t in transactions):
+            return transactions
+
+        last_bad_value = transactions
+        # 다음 시도로 넘어감(마지막 시도였으면 루프 종료 후 아래에서 에러 발생)
+
+    raise ValueError(
+        f"Claude가 {max_attempts}회 시도에도 계속 스키마를 벗어난 응답을 반환했습니다 "
+        f"(마지막 값 타입: {type(last_bad_value).__name__}, 앞부분: {str(last_bad_value)[:200]!r}). "
+        "일시적인 문제일 가능성이 높으니 잠시 후 다시 시도해보세요."
     )
-
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "record_transactions":
-            return block.input.get("transactions", [])
-
-    raise ValueError("Claude 응답에서 record_transactions 도구 호출을 찾지 못했습니다.")
 
 
 # ---------------------------------------------------------------------------
@@ -510,16 +535,35 @@ def parse_transactions_with_gemini(
     else:
         contents = [f"{instruction}\n\n원문:\n---\n{raw_text[:15000]}\n---\n"]
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_json_schema=TRANSACTION_SCHEMA,
-        ),
+    # Claude 쪽에서 실제로 관찰된 "transactions가 배열 대신 문자열로 오는" 문제에
+    # 대한 방어로 여기도 동일하게 재시도 + 형태 검증을 적용함(Gemini는 서버가
+    # response_json_schema를 강제하므로 발생 확률은 낮지만, 만일을 대비).
+    max_attempts = 3
+    last_bad_value = None
+    for attempt in range(1, max_attempts + 1):
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=TRANSACTION_SCHEMA,
+                temperature=0,  # 표를 그대로 옮기는 작업이라 창의성이 불필요하고,
+                # 낮출수록 스키마를 벗어난 응답 확률이 줄어듦.
+            ),
+        )
+        data = json.loads(response.text)
+        transactions = data.get("transactions", [])
+
+        if isinstance(transactions, list) and all(isinstance(t, dict) for t in transactions):
+            return transactions
+
+        last_bad_value = transactions
+
+    raise ValueError(
+        f"Gemini가 {max_attempts}회 시도에도 계속 스키마를 벗어난 응답을 반환했습니다 "
+        f"(마지막 값 타입: {type(last_bad_value).__name__}, 앞부분: {str(last_bad_value)[:200]!r}). "
+        "일시적인 문제일 가능성이 높으니 잠시 후 다시 시도해보세요."
     )
-    data = json.loads(response.text)
-    return data.get("transactions", [])
 
 
 # ---------------------------------------------------------------------------
@@ -541,12 +585,14 @@ def parse_transactions(
 # 4. Google Sheets에 행 추가 — 첨부파일명 기반 월별(YYYYMM) 탭에 씀
 # ---------------------------------------------------------------------------
 def month_tab_name(filename: str) -> str:
-    """파일명에서 8자리 날짜(YYYYMMDD)를 찾아 앞 6자리(YYYYMM)를 탭 이름으로 반환.
-    날짜를 못 찾으면 SHEET_TAB(기본 "시트1")으로 폴백."""
-    m = re.search(r"(\d{8})", filename or "")
+    """파일명에서 YYYYMMDD(8자리, 예: BC바로카드_20260813.pdf) 또는 YYYYMM(6자리,
+    예: hyundaicard_202606.html) 형식의 날짜를 찾아 YYYYMM 형식의 탭 이름으로
+    반환합니다. 카드사/형식마다 파일명에 붙는 날짜 길이가 달라서(실제 확인됨)
+    둘 다 지원합니다. 날짜를 못 찾으면 SHEET_TAB(기본 "시트1")으로 폴백."""
+    m = re.search(r"(20\d{2})(0[1-9]|1[0-2])(?:\d{2})?", filename or "")
     if not m:
         return SHEET_TAB
-    return m.group(1)[:6]
+    return m.group(1) + m.group(2)
 
 
 def ensure_tab(service, spreadsheet_id: str, tab_name: str) -> None:
@@ -584,7 +630,32 @@ def _existing_transaction_keys(service, spreadsheet_id: str, tab_name: str) -> s
     return keys
 
 
+def _validate_transactions(transactions: list) -> None:
+    """AI가 반환한 거래 목록이 예상한 형식(딕셔너리 목록, 필수 키 포함)인지 미리
+    검증합니다. Claude/Gemini가 아주 드물게 요청한 스키마(거래 = 객체 배열)를
+    벗어난 값(예: 문자열 하나)을 반환하는 경우가 실제로 관찰되어(2026-08-27,
+    신한카드/현대카드 처리 중 확인), 그냥 두면 다음 단계에서
+    "string indices must be integers, not 'str'" 같은 원인을 알기 어려운 에러로
+    나타납니다. 여기서 미리 걸러 어떤 항목이 왜 문제인지 명확히 알려줍니다."""
+    required_keys = {"일자", "가맹점", "금액", "분류"}
+    for i, t in enumerate(transactions):
+        if not isinstance(t, dict):
+            raise ValueError(
+                f"AI가 반환한 {i}번째 거래 항목이 예상한 객체 형식이 아닙니다 "
+                f"(타입: {type(t).__name__}, 값: {str(t)[:200]!r}). AI 응답이 "
+                "일시적으로 스키마를 벗어난 것으로 보이니, 잠시 후 재처리"
+                "(Apps Script의 forceReprocessAll)를 시도해보세요."
+            )
+        missing = required_keys - t.keys()
+        if missing:
+            raise ValueError(
+                f"AI가 반환한 {i}번째 거래 항목에 필수 필드가 없습니다: {missing} "
+                f"(값: {str(t)[:200]!r})"
+            )
+
+
 def append_rows_to_sheet(card_name: str, transactions: list[dict], filename: str = "") -> dict:
+    _validate_transactions(transactions)
     creds_info = json.loads(os.environ["SHEETS_SERVICE_ACCOUNT_JSON"])
     creds = service_account.Credentials.from_service_account_info(
         creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
