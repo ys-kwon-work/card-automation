@@ -147,8 +147,8 @@ Flask 앱 하나. 엔드포인트는 `/process`(POST)와 `/healthz`(GET) 둘뿐.
 | `ANTHROPIC_MODEL` / `GEMINI_MODEL` | 기본 `claude-sonnet-5` / `gemini-3.6-flash`, env로 덮어쓰기 가능 |
 | `SHEET_HEADERS` | `["카드명","일자","가맹점","금액","분류"]` |
 | `CATEGORY_CHOICES` | 분류 10종(식비/카페·간식/교통/쇼핑/통신/의료/문화·여가/교육/주거·공과금/기타) |
-| `CATEGORY_OVERRIDE_RULES` | `(키워드들, 분류)` 목록. 가맹점명에 키워드가 포함되면 AI 분류를 강제 교체(위에서부터 첫 매칭 1개). 편의점류(씨유·이마트24·GS25·KFC·`지에스 더프레시`·노랑냉장고)→`카페/간식`, 학원류(교육·학원·스터디·`더지니어스아라`)→`교육` |
-| `EXCLUDED_MERCHANT_SUBSTRINGS` | 가맹점명에 이 문자열이 들어가면 시트에 안 씀(개인 사용내역 제외) |
+| `CATEGORY_OVERRIDE_RULES` | `(키워드들, 분류)` 목록. 가맹점명에 키워드가 포함되면 AI 분류를 강제 교체(위에서부터 첫 매칭 1개). 편의점류(씨유·이마트24·GS25·KFC·`지에스 더프레시`·노랑냉장고)→`카페/간식`, 학원류(교육·학원·스터디·`더지니어스아라`)→`교육`, 대형마트류(홈플러스·하나로마트·트레이더스·농협성남·`(주)이마트`·롯데마트)→`식비` |
+| `EXCLUDED_MERCHANT_SUBSTRINGS` | 가맹점명에 이 문자열이 들어가면 시트에 안 씀(개인 사용내역·통신요금 할인 등 제외) |
 | `GRAND_TOTAL_EXCLUDED_CARDS` | `{"현대카드"}` — 전체 합계에서만 제외(소계엔 포함) |
 | `CHART_EXCLUDED_CARDS` | `{"현대카드"}` — 분류별 원형차트 집계에서 제외 |
 | `TRANSACTION_SCHEMA` | AI가 반환해야 하는 JSON Schema. `transactions: [{일자,가맹점,금액,분류}]` |
