@@ -77,26 +77,38 @@ Google Apps Script(V8). Gmail·트리거·외부 요청·메일 발송 권한을
 
 | 함수 | 호출 방식 | 동작 |
 |---|---|---|
-| `checkNewStatements()` | 시간 트리거(매일) | `runCheck_(false)` — 라벨 없는 메일만 |
+| `checkNewStatements()` | 시간 트리거(4시간마다) | `runCheck_(false)` — 라벨 없는 메일만 |
 | `forceReprocessAll()` | 편집기에서 수동 실행 | `runCheck_(true)` — 라벨 유무 무시하고 전부 |
-| `createTimeTrigger()` | 최초 1회 수동 실행 | `checkNewStatements`용 기존 트리거 제거 후 `everyDays(1).atHour(8)` 재설치 |
+| `createTimeTrigger()` | 최초 1회 수동 실행 | `checkNewStatements`용 기존 트리거 제거 후 `everyHours(4)` 재설치 |
+
+### 시간 예산 (`MAX_RUNTIME_MS`, 5분)
+
+Apps Script는 실행 1회 총 시간 상한이 있다(무료 Gmail 약 6분). `/process` 왕복이
+첨부마다 수십 초~수 분이라 메일이 쌓이면(특히 `forceReprocessAll`) 상한에 걸려
+`Exceeded maximum execution time`으로 죽는다. 그래서 `runCheck_`는 시작 시각을
+기록하고, **경과 5분을 넘기면 남은 스레드/첨부를 건너뛰고 즉시 반환**한다. 남은
+메일은 라벨이 안 붙으므로 다음 트리거 실행이 이어서 처리한다(멱등 + 성공 시에만
+라벨 → 중단 안전). 이 조기 종료를 위해 `runCheck_`/`processThread_`의 순회는
+`forEach`가 아니라 `for` 루프다(콜백에서는 바깥 루프를 못 끊음).
 
 ### `runCheck_(includeAlreadyLabeled)`
 
+- 시작 시각(`startTime`)을 기록한다.
 - 라벨 객체를 준비(`getOrCreateLabel_`)하고, `includeAlreadyLabeled`가 false면
   검색어에 ` -label:정산완료`를 덧붙인다.
 - 카드사 4종을 **각각 따로** 검색한다. 쿼리는 `in:inbox subject:<카드명> subject:명세서`.
   - `in:inbox` → 받은편지함만(보관/다른 라벨 제외). 스팸·휴지통은 `GmailApp.search()`가
     기본적으로 빼므로 추가 조건 불필요.
   - 카드사별로 나눈 이유: 제목 조건이 다르고, 매칭되는 순간 `card_type`을 바로 알 수 있음.
-- 각 스레드마다 `processThread_`.
+- 각 스레드마다, 먼저 시간 예산을 확인하고(초과 시 로그 남기고 `return`) `processThread_` 호출.
 
-### `processThread_(thread, cardType, cfg, label)`
+### `processThread_(thread, cardType, cfg, label, startTime)`
 
 스레드의 모든 메시지 → 모든 첨부파일을 순회하며:
 
 1. 파일명 소문자로 만들어 `ACCEPTED_EXTENSIONS[cardType]` 중 하나로 끝나는지 검사.
    아니면 건너뜀(예: 현대카드 메일에 붙은 안내 PDF).
+1-B. 매 첨부 직전에 시간 예산(`startTime` 기준 5분)을 확인 — 초과면 로그 남기고 `return`.
 2. `cardType`에 맞는 비밀번호를 고른다.
 3. payload 구성: `{card_type, file_base64, password, filename}`.
    `filename`은 원본 이름 그대로(Cloud Run이 여기서 날짜를 뽑아 월별 탭을 정함).

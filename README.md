@@ -416,10 +416,12 @@ gcloud run deploy card-automation \
    | `PROCESSED_LABEL` | (선택) 기본값 `정산완료` — 없으면 자동 생성 |
 
 4. 함수 목록에서 `createTimeTrigger`를 선택해 **1회 수동 실행** → Gmail 권한 승인 팝업이
-   뜨면 허용 (이때 **매일 1회(기본 오전 8시경) 트리거**가 설치됩니다. 실행 시각을 바꾸고
-   싶으면 `Code.gs`의 `createTimeTrigger()` 안 `atHour(8)` 숫자를 원하는 시(0~23)로 고친 뒤
-   Apps Script 편집기에서 다시 저장하고 `createTimeTrigger`를 재실행하면 됩니다 — 재실행 시
-   기존 트리거는 자동으로 지우고 새로 설치합니다)
+   뜨면 허용 (이때 **4시간마다(하루 6회) 트리거**가 설치됩니다. 한 번에 여러 통이 쌓이면
+   `runCheck_`가 5분 시간 예산에서 멈추고 남은 건 다음 실행으로 넘기므로, 자주 돌려야
+   밀린 메일이 하루 안에 다 빠집니다. 하루 1회로 되돌리려면 `Code.gs`의
+   `createTimeTrigger()` 안 `.everyHours(4)`를 `.everyDays(1).atHour(8)`로 바꾼 뒤
+   `createTimeTrigger`를 재실행하면 됩니다 — 재실행 시 기존 트리거는 자동으로 지우고
+   새로 설치합니다)
 5. 실행 > 로그에서 정상 동작 확인, 또는 `checkNewStatements`를 수동 실행해 즉시 테스트
 
 ### Apps Script가 메일을 찾는 조건
@@ -439,7 +441,7 @@ gcloud run deploy card-automation \
 
 ## 중복 방지 + 수동 강제 업데이트
 
-카드사 명세서는 보통 한 달에 한 번만 오지만, 트리거는 매일 실행됩니다. 정상적인
+카드사 명세서는 보통 한 달에 한 번만 오지만, 트리거는 4시간마다 실행됩니다. 정상적인
 경우 `checkNewStatements()`가 "정산완료" 라벨이 없는 메일만 찾으므로 이미 처리한
 명세서를 또 처리하지 않지만, 라벨이 무슨 이유로든 안 붙는 경우(부분 실패 등)를
 대비해 Cloud Run(`main.py`) 쪽에도 안전장치를 넣었습니다: 시트에 **(카드명, 일자,
@@ -490,6 +492,14 @@ gcloud run deploy card-automation \
 - **AI 응답이 스키마를 벗어나는 경우**: 드물게 `transactions`가 객체 배열이 아니라
   문자열로 오는 것이 실측되어, `main.py`는 최대 3회 재시도 후 명확한 에러를 냅니다.
   이 에러가 나면 잠시 후 `forceReprocessAll`로 재시도하면 대부분 해결됩니다.
+- **"Exceeded maximum execution time" (Apps Script)**: Apps Script는 실행 1회당 총
+  시간 상한이 있습니다(무료 Gmail 약 6분). `/process` 왕복은 첨부 1건당 수십 초~수 분이
+  걸려서, 한 번에 여러 통(특히 `forceReprocessAll` 직후)이면 상한에 걸립니다. `runCheck_`가
+  **5분(`MAX_RUNTIME_MS`)이 지나면 남은 메일을 다음 실행으로 넘기고 멈추도록** 되어 있고,
+  트리거도 4시간마다 돌므로 밀린 메일은 자동으로 빠집니다. `forceReprocessAll`은 수동
+  함수라 5분에서 멈추면 로그를 확인하고 한두 번 더 실행하면 됩니다(멱등적이라 안전).
+  Cloud Run 쪽은 `Dockerfile`의 `gunicorn --timeout`을 배포 시 `gcloud run --timeout`
+  이상으로 맞춰 느린 한 건이 502로 죽지 않게 해두었습니다.
 - **파싱 엔진(Claude/Gemini) 전환**: `main.py`에 두 엔진 코드가 모두 남아있으니,
   `.env`나 Cloud Run 환경변수의 `PARSER_ENGINE`만 `claude` ↔ `gemini`로 바꾸면 됩니다.
   코드를 다시 배포할 필요는 없고(Cloud Run은 `gcloud run services update --update-env-vars`),

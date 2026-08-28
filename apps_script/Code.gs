@@ -44,6 +44,18 @@ function getConfig_() {
   };
 }
 
+// Apps Script는 실행 1회당 총 실행 시간 상한이 있습니다(무료 Gmail 계정 약 6분,
+// Workspace 약 30분). Cloud Run 왕복은 첨부 1건당 수십 초~수 분이 걸릴 수 있어
+// (복호화 + Playwright/PDF 렌더 + AI 파싱 재시도 + 시트 기록 + 소계/차트 갱신),
+// 처리할 메일이 쌓여 있으면 — 특히 forceReprocessAll — 이 상한에 걸려
+// "Exceeded maximum execution time"으로 강제 중단됩니다.
+//
+// 그래서 5분이 지나면 남은 메일은 처리하지 않고 깔끔히 멈춥니다. 남은 메일은
+// 라벨이 안 붙으므로 다음 트리거 실행(또는 forceReprocessAll 재실행)에서
+// 그대로 이어서 처리됩니다. Cloud Run이 (카드명,일자,가맹점,금액) 중복을 자동으로
+// 건너뛰고, 라벨도 성공했을 때만 붙으므로 중간에 멈춰도 시트가 깨지지 않습니다.
+const MAX_RUNTIME_MS = 5 * 60 * 1000;
+
 function checkNewStatements() {
   runCheck_(false);
 }
@@ -59,6 +71,7 @@ function forceReprocessAll() {
 }
 
 function runCheck_(includeAlreadyLabeled) {
+  const startTime = Date.now();
   const cfg = getConfig_();
   const label = getOrCreateLabel_(cfg.labelName);
   const exclude = includeAlreadyLabeled ? '' : (' -label:' + cfg.labelName);
@@ -74,18 +87,27 @@ function runCheck_(includeAlreadyLabeled) {
     { cardType: 'SHINHAN', query: 'in:inbox subject:신한카드 subject:명세서' + exclude },
   ];
 
-  searches.forEach(function (s) {
+  for (var i = 0; i < searches.length; i++) {
+    const s = searches[i];
     const threads = GmailApp.search(s.query, 0, 20);
-    threads.forEach(function (thread) {
-      processThread_(thread, s.cardType, cfg, label);
-    });
-  });
+    for (var j = 0; j < threads.length; j++) {
+      if (Date.now() - startTime > MAX_RUNTIME_MS) {
+        Logger.log(
+          '시간 예산(%s분) 초과 — 남은 메일은 다음 실행에서 이어서 처리합니다.',
+          MAX_RUNTIME_MS / 60000
+        );
+        return;
+      }
+      processThread_(threads[j], s.cardType, cfg, label, startTime);
+    }
+  }
 }
 
-function processThread_(thread, cardType, cfg, label) {
+function processThread_(thread, cardType, cfg, label, startTime) {
   const messages = thread.getMessages();
 
-  messages.forEach(function (message) {
+  for (var mi = 0; mi < messages.length; mi++) {
+    const message = messages[mi];
     const attachments = message.getAttachments();
     const password =
       cardType === 'BC' ? cfg.bcPassword :
@@ -93,13 +115,21 @@ function processThread_(thread, cardType, cfg, label) {
       cardType === 'SAMSUNG' ? cfg.samsungPassword :
       cfg.shinhanPassword;
 
-    attachments.forEach(function (attachment) {
+    for (var ai = 0; ai < attachments.length; ai++) {
+      const attachment = attachments[ai];
       const name = attachment.getName().toLowerCase();
       const accepted = ACCEPTED_EXTENSIONS[cardType] || [];
       const matches = accepted.some(function (ext) { return name.endsWith(ext); });
 
       if (!matches) {
-        return; // 이 카드사에서 기대하는 첨부 형식이 아니면 건너뜀
+        continue; // 이 카드사에서 기대하는 첨부 형식이 아니면 건너뜀
+      }
+
+      // 남은 시간이 부족하면 이 첨부는 처리하지 않고 반환 — 라벨이 안 붙으므로
+      // 다음 실행에서 그대로 다시 잡힘.
+      if (Date.now() - startTime > MAX_RUNTIME_MS) {
+        Logger.log('시간 예산 초과 — [%s / %s]는 다음 실행에서 처리합니다.', cardType, attachment.getName());
+        return;
       }
 
       const payload = {
@@ -130,8 +160,8 @@ function processThread_(thread, cardType, cfg, label) {
         Logger.log('처리 실패 [%s / %s]: %s', cardType, attachment.getName(), body.message);
         notifyFailure_(cardType, attachment.getName(), body.message || ('HTTP ' + code));
       }
-    });
-  });
+    }
+  }
 }
 
 function notifyFailure_(cardType, filename, message) {
@@ -148,8 +178,13 @@ function getOrCreateLabel_(name) {
 }
 
 /**
- * 최초 1회만 수동 실행하세요. 매일 지정 시각(기본 오전 8시)에 실행되는
- * 시간 트리거를 설치합니다. 시각을 바꾸려면 atHour() 숫자만 수정하세요.
+ * 최초 1회만 수동 실행하세요. checkNewStatements를 주기 실행하는 시간 트리거를
+ * 설치합니다.
+ *
+ * 기본은 4시간마다입니다(하루 6회). 명세서는 한 달에 한 번씩만 오지만, 한 번에
+ * 여러 통이 쌓였을 때 runCheck_가 5분 시간 예산에서 멈추고 남은 건 다음 실행으로
+ * 넘기므로, 자주 돌려야 밀린 메일이 하루 안에 다 빠집니다. 하루 1회로 되돌리려면
+ * 아래 줄을 `.everyDays(1).atHour(8)`로 바꾸고 이 함수를 다시 실행하세요.
  */
 function createTimeTrigger() {
   // 기존에 등록된 동일 함수의 트리거가 있으면 중복 생성 방지
@@ -158,6 +193,6 @@ function createTimeTrigger() {
       ScriptApp.deleteTrigger(t);
     }
   });
-  ScriptApp.newTrigger('checkNewStatements').timeBased().everyDays(1).atHour(8).create();
-  Logger.log('매일 1회(오전 8시경) 트리거가 설치되었습니다.');
+  ScriptApp.newTrigger('checkNewStatements').timeBased().everyHours(4).create();
+  Logger.log('4시간마다 실행되는 트리거가 설치되었습니다.');
 }
