@@ -85,13 +85,25 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 SHEET_HEADERS = ["카드명", "일자", "가맹점", "금액", "분류"]
-CATEGORY_CHOICES = ["식비", "카페/간식", "교통", "쇼핑", "통신", "의료", "문화/여가", "주거/공과금", "기타"]
+CATEGORY_CHOICES = ["식비", "카페/간식", "교통", "쇼핑", "통신", "의료", "문화/여가", "교육", "주거/공과금", "기타"]
+
+# AI가 매긴 분류를 가맹점명 기준으로 후보정하는 규칙(위에서부터 첫 매칭 1개만 적용).
+# 가맹점명에 keyword 중 하나라도 포함되면 분류를 category로 강제 교체한다(사용자 요청).
+CATEGORY_OVERRIDE_RULES = [
+    # 편의점류 상호 → 카페/간식
+    (["씨유", "이마트24", "GS25", "KFC", "지에스 더프레시", "노랑냉장고"], "카페/간식"),
+    # 학원/교육 관련 → 교육
+    (["교육", "학원", "스터디", "더지니어스아라"], "교육"),
+]
 
 # 가맹점명에 아래 문자열이 포함된 거래는 시트에 아예 기록하지 않음(사용자 요청).
 EXCLUDED_MERCHANT_SUBSTRINGS = ["후불무승인_", "KT통신요금자동납부-991613", "KCP-성남시청"]
 
 # 전체 합계(GRAND_TOTAL_LABEL)에서 제외할 카드명. 카드사별 소계에는 그대로 반영됨.
 GRAND_TOTAL_EXCLUDED_CARDS = {"현대카드"}
+
+# 분류별 지출 비중 원형차트에서 제외할 카드명(사용자 요청 — 현대카드 제외).
+CHART_EXCLUDED_CARDS = {"현대카드"}
 
 TRANSACTION_SCHEMA = {
     "type": "object",
@@ -661,8 +673,21 @@ def _validate_transactions(transactions: list) -> None:
             )
 
 
+def _apply_category_overrides(transactions: list[dict]) -> None:
+    """가맹점명에 특정 문구가 포함되면 AI가 매긴 '분류'를 규칙 기준으로 덮어씁니다.
+    (예: 편의점 상호 → '카페/간식', 학원/교육 관련 → '교육'). CATEGORY_OVERRIDE_RULES를
+    위에서부터 검사해 첫 매칭 1개만 적용합니다. transactions 딕셔너리를 제자리에서 수정."""
+    for t in transactions:
+        merchant = str(t.get("가맹점", ""))
+        for keywords, category in CATEGORY_OVERRIDE_RULES:
+            if any(kw in merchant for kw in keywords):
+                t["분류"] = category
+                break
+
+
 def append_rows_to_sheet(card_name: str, transactions: list[dict], filename: str = "") -> dict:
     _validate_transactions(transactions)
+    _apply_category_overrides(transactions)
     creds_info = json.loads(os.environ["SHEETS_SERVICE_ACCOUNT_JSON"])
     creds = service_account.Credentials.from_service_account_info(
         creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -708,6 +733,12 @@ GRAND_TOTAL_LABEL = "전체 합계"
 SUBTOTAL_COLOR = {"red": 0.85, "green": 0.92, "blue": 1.0}  # 연한 파랑
 GRAND_TOTAL_COLOR = {"red": 1.0, "green": 0.84, "blue": 0.4}  # 진한 금색
 AMOUNT_NUMBER_FORMAT = {"type": "CURRENCY", "pattern": '#,##0"원";-#,##0"원"'}
+
+# 분류별 지출 비중 원형차트 관련.
+# 거래표(A:E)와 겹치지 않도록 G열부터 "분류 / 금액" 2열짜리 집계표를 만들고,
+# 그 표를 데이터 소스로 하는 원형차트를 시트 하단에 항상 1개만 유지한다.
+CATEGORY_SUMMARY_START_COL = 6  # G열 (0-based)
+CATEGORY_CHART_TITLE = "분류별 지출 비중"
 
 
 def _to_amount(value) -> int:
@@ -870,6 +901,106 @@ def apply_card_totals(service, spreadsheet_id: str, tab_name: str) -> None:
         })
 
     service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+
+    # 소계/합계가 최신 상태가 된 직후, 분류별 지출 비중 원형차트를 시트 하단에 갱신.
+    # (전체 합계 행 = new_rows[grand_total_row_index] → 실제 시트에서 0-based 행 번호는
+    #  grand_total_row_index + 1. 그 아래로 두 줄 띄운 자리에 차트를 앵커함.)
+    _upsert_category_pie_chart(
+        service, spreadsheet_id, tab_name, sheet_id,
+        anchor_row_index=grand_total_row_index + 3,
+    )
+
+
+def _upsert_category_pie_chart(
+    service, spreadsheet_id: str, tab_name: str, sheet_id: int, anchor_row_index: int
+) -> None:
+    """분류(E열)별 지출 합계표를 G:H에 만들고, 그 표를 소스로 하는 원형차트를 시트
+    하단에 항상 1개만 유지한다(있으면 지우고 새로 그림 → 위치·데이터가 매 처리마다
+    최신으로 갱신됨).
+
+    - 집계는 시트 수식(SUMIFS)으로 넣어, 나중에 사람이 금액 셀을 직접 고치면 표와
+      차트가 자동으로 다시 계산되게 한다(소계/전체 합계와 동일한 설계).
+    - CHART_EXCLUDED_CARDS(현대카드)는 SUMIFS 조건에서 제외하므로 차트에 반영되지 않는다.
+    """
+    start_col = CATEGORY_SUMMARY_START_COL
+
+    # 차트에서 제외할 카드사(현대카드 등)를 SUMIFS 조건으로도 그대로 제외
+    excl = "".join(f',$A:$A,"<>"&"{c}"' for c in sorted(CHART_EXCLUDED_CARDS))
+
+    def _text_cell(value: str, bold: bool = False) -> dict:
+        fmt = {"numberFormat": {"type": "TEXT"}}
+        if bold:
+            fmt["textFormat"] = {"bold": True}
+        return {"userEnteredValue": {"stringValue": value}, "userEnteredFormat": fmt}
+
+    table_rows = [{"values": [_text_cell("분류", bold=True), _text_cell("금액", bold=True)]}]
+    for i, category in enumerate(CATEGORY_CHOICES):
+        sheet_row = i + 2  # G2, G3, ... (헤더가 1행)
+        formula = f"=SUMIFS($D:$D,$E:$E,$G{sheet_row}{excl})"
+        table_rows.append({"values": [
+            _text_cell(category),
+            {
+                "userEnteredValue": {"formulaValue": formula},
+                "userEnteredFormat": {"numberFormat": AMOUNT_NUMBER_FORMAT},
+            },
+        ]})
+
+    # 이 탭에 이미 있는 '분류별 지출 비중' 차트(이전 처리에서 만든 것)를 찾아 삭제 대상에 넣음
+    chart_meta = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title),charts(chartId,spec(title)))",
+    ).execute()
+    stale_chart_ids: list[int] = []
+    for s in chart_meta.get("sheets", []):
+        if s.get("properties", {}).get("title") != tab_name:
+            continue
+        for chart in s.get("charts", []):
+            if chart.get("spec", {}).get("title") == CATEGORY_CHART_TITLE:
+                stale_chart_ids.append(chart["chartId"])
+
+    data_row_count = 1 + len(CATEGORY_CHOICES)  # 헤더 + 분류 9종
+    requests: list[dict] = [
+        {"deleteEmbeddedObject": {"objectId": cid}} for cid in stale_chart_ids
+    ]
+    requests.append({
+        "updateCells": {
+            "rows": table_rows,
+            "fields": "userEnteredValue,userEnteredFormat.numberFormat,userEnteredFormat.textFormat",
+            "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": start_col},
+        }
+    })
+    requests.append({
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": CATEGORY_CHART_TITLE,
+                    "pieChart": {
+                        "legendPosition": "RIGHT_LEGEND",
+                        "domain": {"sourceRange": {"sources": [{
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0, "endRowIndex": data_row_count,
+                            "startColumnIndex": start_col, "endColumnIndex": start_col + 1,
+                        }]}},
+                        "series": {"sourceRange": {"sources": [{
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0, "endRowIndex": data_row_count,
+                            "startColumnIndex": start_col + 1, "endColumnIndex": start_col + 2,
+                        }]}},
+                        "pieHole": 0,
+                    },
+                },
+                "position": {"overlayPosition": {
+                    "anchorCell": {"sheetId": sheet_id, "rowIndex": max(anchor_row_index, 0), "columnIndex": 0},
+                    "offsetXPixels": 0, "offsetYPixels": 0,
+                    "widthPixels": 600, "heightPixels": 371,
+                }},
+            }
+        }
+    })
+
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": requests}
+    ).execute()
 
 
 # ---------------------------------------------------------------------------

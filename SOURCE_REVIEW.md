@@ -132,11 +132,13 @@ Flask 앱 하나. 엔드포인트는 `/process`(POST)와 `/healthz`(GET) 둘뿐.
 |---|---|
 | `SHEET_TAB` | 파일명에서 날짜를 못 찾을 때 쓰는 폴백 탭 이름(기본 `시트1`) |
 | `PARSER_ENGINE` | `claude`(기본) 또는 `gemini`. env에서 읽어 소문자화 |
-| `ANTHROPIC_MODEL` / `GEMINI_MODEL` | 기본 `claude-sonnet-5` / `gemini-2.5-flash`, env로 덮어쓰기 가능 |
+| `ANTHROPIC_MODEL` / `GEMINI_MODEL` | 기본 `claude-sonnet-5` / `gemini-3.6-flash`, env로 덮어쓰기 가능 |
 | `SHEET_HEADERS` | `["카드명","일자","가맹점","금액","분류"]` |
-| `CATEGORY_CHOICES` | 분류 9종(식비/카페·간식/교통/쇼핑/통신/의료/문화·여가/주거·공과금/기타) |
+| `CATEGORY_CHOICES` | 분류 10종(식비/카페·간식/교통/쇼핑/통신/의료/문화·여가/교육/주거·공과금/기타) |
+| `CATEGORY_OVERRIDE_RULES` | `(키워드들, 분류)` 목록. 가맹점명에 키워드가 포함되면 AI 분류를 강제 교체(위에서부터 첫 매칭 1개). 편의점류(씨유·이마트24·GS25·KFC·`지에스 더프레시`·노랑냉장고)→`카페/간식`, 학원류(교육·학원·스터디·`더지니어스아라`)→`교육` |
 | `EXCLUDED_MERCHANT_SUBSTRINGS` | 가맹점명에 이 문자열이 들어가면 시트에 안 씀(개인 사용내역 제외) |
 | `GRAND_TOTAL_EXCLUDED_CARDS` | `{"현대카드"}` — 전체 합계에서만 제외(소계엔 포함) |
+| `CHART_EXCLUDED_CARDS` | `{"현대카드"}` — 분류별 원형차트 집계에서 제외 |
 | `TRANSACTION_SCHEMA` | AI가 반환해야 하는 JSON Schema. `transactions: [{일자,가맹점,금액,분류}]` |
 | `_build_parse_instruction(card_name)` | 파싱 프롬프트 문자열 생성(규칙: 합계행 제외, 취소=음수, 가맹점 원문, 분류는 enum) |
 
@@ -270,6 +272,7 @@ AI 반환값이 `list[dict]`이고 각 항목에 `{일자,가맹점,금액,분�
 #### `append_rows_to_sheet(card_name, transactions, filename="") -> {added, skipped}`
 
 1. `_validate_transactions`.
+1-B. `_apply_category_overrides` — 가맹점명이 `CATEGORY_OVERRIDE_RULES`에 걸리면 `분류`를 제자리에서 교체(AI 결과보다 우선). `/process` 응답의 `transactions`에도 반영됨.
 2. `SHEETS_SERVICE_ACCOUNT_JSON`으로 서비스 계정 자격증명 → `sheets v4` 클라이언트.
 3. `month_tab_name(filename)` → `ensure_tab`.
 4. `_existing_transaction_keys`로 기존 키 집합 확보.
@@ -298,6 +301,21 @@ AI 반환값이 `list[dict]`이고 각 항목에 `{일자,가맹점,금액,분�
 > **왜 값·서식을 한 요청에 묶나**: 값을 먼저 쓰고 서식을 나중에 별도 요청으로 입히면,
 > Sheets가 값 입력 시점에 열 서식을 "자동 감지"로 되돌려 통화 서식이 사라지는
 > 경우가 있었음(2026-08-26 확인). 원자적으로 적용하면 사라지지 않음.
+
+8. **`_upsert_category_pie_chart` 호출** — 소계/합계가 최신이 된 직후 분류별 원형차트 갱신.
+
+#### `_upsert_category_pie_chart(service, spreadsheet_id, tab_name, sheet_id, anchor_row_index)`  — 분류별 지출 비중 원형차트 (멱등)
+
+1. 거래표(A:E)와 겹치지 않게 **G:H에 "분류 / 금액" 2열 집계표**를 `updateCells`로 씀.
+   각 분류 행의 금액은 고정값이 아니라 수식 `=SUMIFS($D:$D,$E:$E,$G행,$A:$A,"<>"&"현대카드")`.
+   → 사람이 나중에 금액 셀을 고치면 표·차트가 자동 재계산됨(소계/합계와 같은 설계).
+   `CHART_EXCLUDED_CARDS`(현대카드)는 SUMIFS 조건에서 빠지므로 차트에 안 잡힘.
+2. 스프레드시트 메타에서 이 탭에 이미 있는 제목 `분류별 지출 비중` 차트를 찾아
+   `deleteEmbeddedObject`로 지운 뒤, 같은 `batchUpdate`에서 `addChart`로 다시 그림.
+   → 매 처리마다 차트가 1개만 유지되고, 위치(전체 합계 두 줄 아래)·데이터가 최신으로 갱신됨.
+   사용자가 직접 만든 다른 차트는 제목이 안 맞으므로 건드리지 않음.
+3. 차트는 `overlayPosition`으로 전체 합계 행 아래(`anchor_row_index`, A열)에 앵커.
+   도메인=G1:G10, 계열=H1:H10, 범례는 오른쪽.
 
 #### 값 정규화 헬퍼
 
