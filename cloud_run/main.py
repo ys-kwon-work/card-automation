@@ -104,11 +104,12 @@ EXCLUDED_MERCHANT_SUBSTRINGS = [
     "KT 통신요금 기본할인", "KT 통신요금 추가할인",
 ]
 
-# 전체 합계(GRAND_TOTAL_LABEL)에서 제외할 카드명. 카드사별 소계에는 그대로 반영됨.
-GRAND_TOTAL_EXCLUDED_CARDS = {"현대카드"}
-
-# 분류별 지출 비중 원형차트에서 제외할 카드명(사용자 요청 — 현대카드 제외).
-CHART_EXCLUDED_CARDS = {"현대카드"}
+# 개인 사용내역 카드명 — 전체 합계(GRAND_TOTAL_LABEL)와 분류별 지출 비중 원형차트
+# 양쪽 모두에서 제외한다(사용자 요청). 카드사별 소계에는 그대로 반영됨.
+# 예전엔 GRAND_TOTAL_EXCLUDED_CARDS / CHART_EXCLUDED_CARDS로 따로 선언되어 있어서,
+# 카드를 추가/삭제할 때 한쪽만 고치면 전체 합계와 차트가 서로 다른 카드 기준으로
+# 계산되어 조용히 어긋날 위험이 있었음(2026-08-28 코드리뷰로 확인) — 하나로 합침.
+PERSONAL_USE_EXCLUDED_CARDS = {"현대카드"}
 
 TRANSACTION_SCHEMA = {
     "type": "object",
@@ -129,6 +130,71 @@ TRANSACTION_SCHEMA = {
     },
     "required": ["transactions"],
 }
+
+REQUIRED_TRANSACTION_KEYS = {"일자", "가맹점", "금액", "분류"}
+
+
+def _transaction_shape_error(t) -> str | None:
+    """거래 항목 하나가 올바른 형태(딕셔너리 + 필수 필드 + 필드별 타입)인지 검사합니다.
+    문제가 있으면 이유를 담은 문자열을, 정상이면 None을 반환합니다.
+
+    2026-08-28 코드리뷰로 확인된 문제: 예전엔 필수 키가 "있는지"만 확인하고 값의
+    타입은 확인하지 않아서, AI가 가맹점 등을 null/숫자로 반환해도 통과시킨 뒤
+    EXCLUDED_MERCHANT_SUBSTRINGS 필터링(`sub in t["가맹점"]`)에서 `in`을 문자열이
+    아닌 값에 적용하다 TypeError가 나는 문제가 있었음 — 여기서 값 타입까지 미리
+    걸러서 막는다."""
+    if not isinstance(t, dict):
+        return f"객체(dict)가 아님 (타입: {type(t).__name__})"
+    missing = REQUIRED_TRANSACTION_KEYS - t.keys()
+    if missing:
+        return f"필수 필드 누락: {sorted(missing)}"
+    if not isinstance(t.get("일자"), str):
+        return f"'일자' 값이 문자열이 아님 (타입: {type(t.get('일자')).__name__})"
+    if not isinstance(t.get("가맹점"), str):
+        return f"'가맹점' 값이 문자열이 아님 (타입: {type(t.get('가맹점')).__name__})"
+    if isinstance(t.get("금액"), bool) or not isinstance(t.get("금액"), (int, float)):
+        return f"'금액' 값이 숫자가 아님 (타입: {type(t.get('금액')).__name__})"
+    if not isinstance(t.get("분류"), str):
+        return f"'분류' 값이 문자열이 아님 (타입: {type(t.get('분류')).__name__})"
+    return None
+
+
+def _is_valid_transactions(transactions) -> bool:
+    """transactions가 올바른 형태(딕셔너리 배열, 필수 필드+타입 전부 정상)인지 여부만
+    돌려줍니다. parse_transactions_with_claude/gemini의 재시도 루프에서 "이 응답을
+    받아들여도 되는가"를 판단하는 데 씁니다."""
+    if not isinstance(transactions, list):
+        return False
+    return all(_transaction_shape_error(t) is None for t in transactions)
+
+
+def _call_ai_with_retry(engine_name: str, call_fn, max_attempts: int = 3) -> list[dict]:
+    """call_fn()을 최대 max_attempts회 호출해서 올바른 형태의 거래 목록을 받을 때까지
+    재시도합니다. Claude/Gemini 둘 다 거의 동일한 재시도 로직이 필요해서(2026-08-28
+    코드리뷰로 중복이 지적됨) 여기 하나로 모았습니다.
+
+    call_fn은 API를 1회 호출해서 파싱된 transactions 값(형태가 틀렸으면 None이거나
+    비정상 값이어도 됨)을 반환해야 합니다. 재시도해도 소용없는 확정적 실패(예: Claude가
+    max_tokens 한도에 걸려 도구 호출 자체가 잘린 경우)는 call_fn이 직접 ValueError를
+    던져서 즉시 중단시킬 수 있습니다 — 그런 경우까지 3번 재시도하면 지연시간/비용만
+    낭비하고 어차피 다시 실패할 가능성이 높기 때문입니다.
+
+    아주 드물게(2026-08-27 실제 관찰, 4번 중 1번꼴) AI가 "transactions" 값을 스키마
+    (객체 배열)를 벗어나 문자열 하나로 반환하는 경우가 있음 — 같은 요청을 다시 보내면
+    대부분 정상으로 돌아오는 것으로 확인되어 재시도로 대응합니다.
+    """
+    last_bad_value = None
+    for _ in range(max_attempts):
+        transactions = call_fn()
+        if _is_valid_transactions(transactions):
+            return transactions
+        last_bad_value = transactions
+
+    raise ValueError(
+        f"{engine_name}가 {max_attempts}회 시도에도 계속 스키마를 벗어난 응답을 반환했습니다 "
+        f"(마지막 값 타입: {type(last_bad_value).__name__}, 앞부분: {str(last_bad_value)[:200]!r}). "
+        "일시적인 문제일 가능성이 높으니 잠시 후 다시 시도해보세요."
+    )
 
 
 def _build_parse_instruction(card_name: str) -> str:
@@ -243,15 +309,31 @@ def decrypt_bc_excel(file_bytes: bytes, password: str) -> str:
         # 신형(.xlsx) 파서로 못 열면 구형(.xls, BIFF8) 포맷일 수 있으니 xlrd로 재시도
         decrypted.seek(0)
         import xlrd
+        import xlrd.xldate
 
         wb = xlrd.open_workbook(file_contents=decrypted.read())
         for sheet in wb.sheets():
             lines.append(f"[시트: {sheet.name}]")
             for row_idx in range(sheet.nrows):
-                row = sheet.row_values(row_idx)
-                if all(c == "" for c in row):
+                cells = sheet.row(row_idx)
+                if all(c.value == "" for c in cells):
                     continue
-                lines.append("\t".join(str(c) for c in row))
+                # 주의: row_values()만 쓰면 openpyxl(데이터 전용 모드에서 실제
+                # datetime을 돌려줌)과 달리 날짜 서식이 적용된 셀도 원시 숫자
+                # 일련번호(예: 46023.0)로 그대로 나와서 AI에 깨진 날짜가 그대로
+                # 전달됨(2026-08-28 코드리뷰로 확인) — 셀 타입이 XL_CELL_DATE면
+                # 명시적으로 날짜 문자열로 변환한다.
+                formatted = []
+                for c in cells:
+                    if c.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            dt = xlrd.xldate.xldate_as_datetime(c.value, wb.datemode)
+                            formatted.append(dt.strftime("%Y-%m-%d"))
+                        except Exception:
+                            formatted.append(str(c.value))
+                    else:
+                        formatted.append(str(c.value))
+                lines.append("\t".join(formatted))
 
     text = "\n".join(lines)
     if not text.strip():
@@ -483,16 +565,8 @@ def parse_transactions_with_claude(
     # 참고: temperature로 응답을 더 결정적으로 만들어보려 했으나, 현재 설치된
     # anthropic SDK(1.0.0)의 messages.create()가 temperature 파라미터 자체를 받지
     # 않음(실제 확인됨 — 전달 시 "unexpected keyword argument" TypeError 발생).
-    #
-    # 대신 재시도로 대응함: 아주 드물게(2026-08-27 실제 관찰, 4번 중 1번꼴)
-    # record_transactions의 "transactions" 입력값이 스키마(객체 배열)를 벗어나
-    # JSON 전체가 문자열 하나로 오는 경우가 있음 — 그대로 두면 호출부에서
-    # "string indices must be integers, not 'str'"처럼 원인을 알기 어려운 에러로
-    # 나타남. 같은 요청을 다시 보내면 대부분 정상으로 돌아오는 것으로 확인되어
-    # 최대 3회까지 자동 재시도한다.
-    max_attempts = 3
-    last_bad_value = None
-    for attempt in range(1, max_attempts + 1):
+    # 대신 _call_ai_with_retry()의 재시도로 대응함 — 자세한 배경은 그 함수 docstring 참고.
+    def _call_claude() -> list | None:
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=4096,
@@ -501,23 +575,22 @@ def parse_transactions_with_claude(
             messages=[{"role": "user", "content": content}],
         )
 
-        transactions = None
+        if response.stop_reason == "max_tokens":
+            # max_tokens(고정값)에 걸려 도구 호출 전에 응답이 잘린 경우 — 같은 입력을
+            # 그대로 재시도하면 십중팔구 또 같은 지점에서 잘리므로(2026-08-28
+            # 코드리뷰로 지적됨), 3번 재시도로 낭비하지 말고 바로 명확한 에러로 중단.
+            raise ValueError(
+                "Claude 응답이 max_tokens(4096) 한도에 도달해 record_transactions 도구 "
+                "호출 전에 잘렸습니다. 명세서 페이지 수가 많다면 이미지 수를 줄이거나 "
+                "main.py의 max_tokens 값을 늘려야 합니다."
+            )
+
         for block in response.content:
             if block.type == "tool_use" and block.name == "record_transactions":
-                transactions = block.input.get("transactions", [])
-                break
+                return block.input.get("transactions", [])
+        return None  # 도구 호출을 못 찾음 — _call_ai_with_retry가 재시도 대상으로 처리
 
-        if isinstance(transactions, list) and all(isinstance(t, dict) for t in transactions):
-            return transactions
-
-        last_bad_value = transactions
-        # 다음 시도로 넘어감(마지막 시도였으면 루프 종료 후 아래에서 에러 발생)
-
-    raise ValueError(
-        f"Claude가 {max_attempts}회 시도에도 계속 스키마를 벗어난 응답을 반환했습니다 "
-        f"(마지막 값 타입: {type(last_bad_value).__name__}, 앞부분: {str(last_bad_value)[:200]!r}). "
-        "일시적인 문제일 가능성이 높으니 잠시 후 다시 시도해보세요."
-    )
+    return _call_ai_with_retry("Claude", _call_claude)
 
 
 # ---------------------------------------------------------------------------
@@ -554,12 +627,10 @@ def parse_transactions_with_gemini(
     else:
         contents = [f"{instruction}\n\n원문:\n---\n{raw_text[:15000]}\n---\n"]
 
-    # Claude 쪽에서 실제로 관찰된 "transactions가 배열 대신 문자열로 오는" 문제에
-    # 대한 방어로 여기도 동일하게 재시도 + 형태 검증을 적용함(Gemini는 서버가
+    # Claude 쪽에서 실제로 관찰된 "transactions가 배열 대신 문자열로 오는" 문제에 대한
+    # 방어로 여기도 _call_ai_with_retry()의 동일한 재시도 정책을 공유함(Gemini는 서버가
     # response_schema를 강제하므로 발생 확률은 낮지만, 만일을 대비).
-    max_attempts = 3
-    last_bad_value = None
-    for attempt in range(1, max_attempts + 1):
+    def _call_gemini() -> list | None:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
@@ -575,19 +646,16 @@ def parse_transactions_with_gemini(
                 # 낮출수록 스키마를 벗어난 응답 확률이 줄어듦.
             ),
         )
-        data = json.loads(response.text)
-        transactions = data.get("transactions", [])
+        try:
+            data = json.loads(response.text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # 안전 필터링/응답 잘림 등으로 response.text가 JSON이 아니거나 비어있는
+            # 경우(2026-08-28 코드리뷰로 지적됨) — 예외를 그대로 던지면 재시도가 전혀
+            # 안 되고 바로 실패했었음. None을 돌려줘서 재시도 대상으로 처리한다.
+            return None
+        return data.get("transactions", [])
 
-        if isinstance(transactions, list) and all(isinstance(t, dict) for t in transactions):
-            return transactions
-
-        last_bad_value = transactions
-
-    raise ValueError(
-        f"Gemini가 {max_attempts}회 시도에도 계속 스키마를 벗어난 응답을 반환했습니다 "
-        f"(마지막 값 타입: {type(last_bad_value).__name__}, 앞부분: {str(last_bad_value)[:200]!r}). "
-        "일시적인 문제일 가능성이 높으니 잠시 후 다시 시도해보세요."
-    )
+    return _call_ai_with_retry("Gemini", _call_gemini)
 
 
 # ---------------------------------------------------------------------------
@@ -612,8 +680,13 @@ def month_tab_name(filename: str) -> str:
     """파일명에서 YYYYMMDD(8자리, 예: BC바로카드_20260813.pdf) 또는 YYYYMM(6자리,
     예: hyundaicard_202606.html) 형식의 날짜를 찾아 YYYYMM 형식의 탭 이름으로
     반환합니다. 카드사/형식마다 파일명에 붙는 날짜 길이가 달라서(실제 확인됨)
-    둘 다 지원합니다. 날짜를 못 찾으면 SHEET_TAB(기본 "시트1")으로 폴백."""
-    m = re.search(r"(20\d{2})(0[1-9]|1[0-2])(?:\d{2})?", filename or "")
+    둘 다 지원합니다. 날짜를 못 찾으면 SHEET_TAB(기본 "시트1")으로 폴백.
+
+    주의: 정규식 앞뒤에 (?<!\\d)/(?!\\d) 경계를 둬서, 더 긴 숫자열(회원번호·계좌번호
+    등)의 일부가 우연히 "20YY"+유효한 월처럼 보여도 매칭되지 않게 함(2026-08-28
+    코드리뷰로 지적됨 — 경계가 없으면 예: "회원번호2026089_20261215.pdf"에서 실제
+    날짜(20261215)보다 앞의 회원번호 조각이 먼저 매칭될 수 있었음)."""
+    m = re.search(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?:\d{2})?(?!\d)", filename or "")
     if not m:
         return SHEET_TAB
     return m.group(1) + m.group(2)
@@ -655,26 +728,23 @@ def _existing_transaction_keys(service, spreadsheet_id: str, tab_name: str) -> s
 
 
 def _validate_transactions(transactions: list) -> None:
-    """AI가 반환한 거래 목록이 예상한 형식(딕셔너리 목록, 필수 키 포함)인지 미리
-    검증합니다. Claude/Gemini가 아주 드물게 요청한 스키마(거래 = 객체 배열)를
-    벗어난 값(예: 문자열 하나)을 반환하는 경우가 실제로 관찰되어(2026-08-27,
-    신한카드/현대카드 처리 중 확인), 그냥 두면 다음 단계에서
-    "string indices must be integers, not 'str'" 같은 원인을 알기 어려운 에러로
-    나타납니다. 여기서 미리 걸러 어떤 항목이 왜 문제인지 명확히 알려줍니다."""
-    required_keys = {"일자", "가맹점", "금액", "분류"}
+    """AI가 반환한 거래 목록이 예상한 형식(딕셔너리 목록, 필수 키 + 값 타입 전부 정상)인지
+    미리 검증합니다. parse_transactions_with_claude/gemini가 반환하기 전에 이미
+    _is_valid_transactions()로 같은 검사를 거치지만, 호출 경로가 늘어나도 항상 안전하게
+    만들 마지막 방어선으로 여기서도 다시 확인합니다(_transaction_shape_error를 공유해서
+    두 검사가 서로 다른 기준으로 어긋나지 않게 함 — 2026-08-28 코드리뷰로 확인된
+    문제: 예전엔 필수 키가 "있는지"만 보고 값 타입(예: 가맹점이 null/숫자)은 안 봐서,
+    통과된 값이 나중에 EXCLUDED_MERCHANT_SUBSTRINGS 필터링에서 TypeError를 냈었음).
+    """
+    if not isinstance(transactions, list):
+        raise ValueError(f"거래 목록 자체가 배열이 아닙니다 (타입: {type(transactions).__name__}).")
     for i, t in enumerate(transactions):
-        if not isinstance(t, dict):
+        err = _transaction_shape_error(t)
+        if err:
             raise ValueError(
-                f"AI가 반환한 {i}번째 거래 항목이 예상한 객체 형식이 아닙니다 "
-                f"(타입: {type(t).__name__}, 값: {str(t)[:200]!r}). AI 응답이 "
-                "일시적으로 스키마를 벗어난 것으로 보이니, 잠시 후 재처리"
-                "(Apps Script의 forceReprocessAll)를 시도해보세요."
-            )
-        missing = required_keys - t.keys()
-        if missing:
-            raise ValueError(
-                f"AI가 반환한 {i}번째 거래 항목에 필수 필드가 없습니다: {missing} "
-                f"(값: {str(t)[:200]!r})"
+                f"AI가 반환한 {i}번째 거래 항목이 올바르지 않습니다: {err} "
+                f"(값: {str(t)[:200]!r}). AI 응답이 일시적으로 스키마를 벗어난 것으로 "
+                "보이니, 잠시 후 재처리(Apps Script의 forceReprocessAll)를 시도해보세요."
             )
 
 
@@ -831,11 +901,11 @@ def apply_card_totals(service, spreadsheet_id: str, tab_name: str) -> None:
         subtotal_row_indices.append(len(new_rows) - 1)
         subtotal_cell_by_card[card] = f"{AMOUNT_COL}{_sheet_row(len(new_rows) - 1)}"
 
-    # 전체 합계는 개인 사용내역 카드사(GRAND_TOTAL_EXCLUDED_CARDS)를 뺀 나머지
+    # 전체 합계는 개인 사용내역 카드사(PERSONAL_USE_EXCLUDED_CARDS)를 뺀 나머지
     # 카드사 소계 셀들만 더하는 수식으로 만듦(소계 자체가 이미 수식이라 개별 거래
     # 금액이 바뀌면 소계 → 전체 합계까지 자동으로 반영됨).
     included_refs = [
-        subtotal_cell_by_card[card] for card in order if card not in GRAND_TOTAL_EXCLUDED_CARDS
+        subtotal_cell_by_card[card] for card in order if card not in PERSONAL_USE_EXCLUDED_CARDS
     ]
     grand_total_formula = "=SUM(" + ",".join(included_refs) + ")" if included_refs else "=0"
     new_rows.append([GRAND_TOTAL_LABEL, "", "", grand_total_formula, ""])
@@ -925,12 +995,13 @@ def _upsert_category_pie_chart(
 
     - 집계는 시트 수식(SUMIFS)으로 넣어, 나중에 사람이 금액 셀을 직접 고치면 표와
       차트가 자동으로 다시 계산되게 한다(소계/전체 합계와 동일한 설계).
-    - CHART_EXCLUDED_CARDS(현대카드)는 SUMIFS 조건에서 제외하므로 차트에 반영되지 않는다.
+    - PERSONAL_USE_EXCLUDED_CARDS(현대카드)는 SUMIFS 조건에서 제외하므로 차트에 반영되지
+      않는다(전체 합계와 동일한 제외 목록을 공유 — 따로 관리하면 둘이 어긋날 수 있음).
     """
     start_col = CATEGORY_SUMMARY_START_COL
 
     # 차트에서 제외할 카드사(현대카드 등)를 SUMIFS 조건으로도 그대로 제외
-    excl = "".join(f',$A:$A,"<>"&"{c}"' for c in sorted(CHART_EXCLUDED_CARDS))
+    excl = "".join(f',$A:$A,"<>"&"{c}"' for c in sorted(PERSONAL_USE_EXCLUDED_CARDS))
 
     def _text_cell(value: str, bold: bool = False) -> dict:
         fmt = {"numberFormat": {"type": "TEXT"}}
