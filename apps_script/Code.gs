@@ -98,12 +98,12 @@ function runCheck_(includeAlreadyLabeled) {
         );
         return;
       }
-      processThread_(threads[j], s.cardType, cfg, label, startTime);
+      processThread_(threads[j], s.cardType, cfg, label);
     }
   }
 }
 
-function processThread_(thread, cardType, cfg, label, startTime) {
+function processThread_(thread, cardType, cfg, label) {
   const messages = thread.getMessages();
 
   for (var mi = 0; mi < messages.length; mi++) {
@@ -115,6 +115,16 @@ function processThread_(thread, cardType, cfg, label, startTime) {
       cardType === 'SAMSUNG' ? cfg.samsungPassword :
       cfg.shinhanPassword;
 
+    // 주의: 시간 예산(MAX_RUNTIME_MS) 체크는 여기(첨부 단위)가 아니라 runCheck_의
+    // 스레드 단위 루프에서만 합니다. 예전엔 여기서도 첨부마다 체크했는데, 한
+    // 스레드에 첨부가 2개 이상 있을 때 1번째가 성공해서 thread.addLabel()이 이미
+    // 실행된 뒤 2번째 처리 전에 시간 예산이 초과되면 함수가 그냥 반환되어 버리고,
+    // 스레드는 이미 라벨이 붙어 있어 다음 실행에서 검색 조건(-label:라벨)에 걸려
+    // 영구히 제외되는 문제가 있었습니다(2026-08-28 코드리뷰로 확인) — 즉 2번째
+    // 첨부의 거래가 수동 forceReprocessAll 전까지 영원히 시트에 안 들어감. 한
+    // 스레드를 시작하면 끝까지(그 스레드의 첨부를 전부) 처리하는 것으로 바꿔서
+    // 이 문제를 없앴습니다(스레드당 첨부가 보통 1~2개라 예산을 살짝 넘기는 정도의
+    // 비용은 감수할 만함).
     for (var ai = 0; ai < attachments.length; ai++) {
       const attachment = attachments[ai];
       const name = attachment.getName().toLowerCase();
@@ -125,13 +135,6 @@ function processThread_(thread, cardType, cfg, label, startTime) {
         continue; // 이 카드사에서 기대하는 첨부 형식이 아니면 건너뜀
       }
 
-      // 남은 시간이 부족하면 이 첨부는 처리하지 않고 반환 — 라벨이 안 붙으므로
-      // 다음 실행에서 그대로 다시 잡힘.
-      if (Date.now() - startTime > MAX_RUNTIME_MS) {
-        Logger.log('시간 예산 초과 — [%s / %s]는 다음 실행에서 처리합니다.', cardType, attachment.getName());
-        return;
-      }
-
       const payload = {
         card_type: cardType,
         file_base64: Utilities.base64Encode(attachment.getBytes()),
@@ -139,26 +142,50 @@ function processThread_(thread, cardType, cfg, label, startTime) {
         filename: attachment.getName(),
       };
 
-      const response = UrlFetchApp.fetch(cfg.cloudRunUrl + '/process', {
-        method: 'post',
-        contentType: 'application/json',
-        headers: { 'X-Shared-Secret': cfg.sharedSecret },
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true,
-      });
+      try {
+        const response = UrlFetchApp.fetch(cfg.cloudRunUrl + '/process', {
+          method: 'post',
+          contentType: 'application/json',
+          headers: { 'X-Shared-Secret': cfg.sharedSecret },
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true,
+        });
 
-      const code = response.getResponseCode();
-      const body = JSON.parse(response.getContentText());
+        const code = response.getResponseCode();
+        var body;
+        try {
+          body = JSON.parse(response.getContentText());
+        } catch (parseErr) {
+          // Cloud Run 앞단 인프라(로드밸런서 타임아웃, 502/503/504 등)가 Flask
+          // 앱까지 요청을 못 넘기고 JSON이 아닌 응답(HTML/빈 본문)을 주는 경우 —
+          // 이 첨부 하나만 실패로 기록하고 나머지 첨부/스레드는 계속 처리합니다
+          // (2026-08-28 코드리뷰로 지적됨: 예전엔 여기서 잡히지 않은 예외가 그대로
+          // 튀어나가 runCheck_ 전체가 조용히 중단됐었음 — 실패 메일도 안 가고
+          // 남은 모든 카드사/스레드가 그냥 건너뛰어짐).
+          Logger.log(
+            '처리 실패 [%s / %s]: 응답이 JSON이 아님 (HTTP %s): %s',
+            cardType, attachment.getName(), code, response.getContentText().substring(0, 200)
+          );
+          notifyFailure_(cardType, attachment.getName(), 'HTTP ' + code + ' (JSON이 아닌 응답 — 인프라 오류로 추정)');
+          continue;
+        }
 
-      if (code === 200 && body.status === 'ok') {
-        thread.addLabel(label);
-        Logger.log(
-          '%s 처리 완료: %s건 추가, %s건 중복 건너뜀 (%s)',
-          cardType, body.rows_added, body.rows_skipped || 0, attachment.getName()
-        );
-      } else {
-        Logger.log('처리 실패 [%s / %s]: %s', cardType, attachment.getName(), body.message);
-        notifyFailure_(cardType, attachment.getName(), body.message || ('HTTP ' + code));
+        if (code === 200 && body.status === 'ok') {
+          thread.addLabel(label);
+          Logger.log(
+            '%s 처리 완료: %s건 추가, %s건 중복 건너뜀 (%s)',
+            cardType, body.rows_added, body.rows_skipped || 0, attachment.getName()
+          );
+        } else {
+          Logger.log('처리 실패 [%s / %s]: %s', cardType, attachment.getName(), body.message);
+          notifyFailure_(cardType, attachment.getName(), body.message || ('HTTP ' + code));
+        }
+      } catch (fetchErr) {
+        // UrlFetchApp.fetch 자체가 예외를 던지는 경우(네트워크 오류 등,
+        // muteHttpExceptions로도 못 막는 케이스) — 마찬가지로 이 첨부만 실패
+        // 처리하고 나머지는 계속 진행합니다.
+        Logger.log('처리 실패 [%s / %s]: %s', cardType, attachment.getName(), fetchErr);
+        notifyFailure_(cardType, attachment.getName(), String(fetchErr));
       }
     }
   }
