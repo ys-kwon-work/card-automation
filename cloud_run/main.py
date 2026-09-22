@@ -363,11 +363,13 @@ def decrypt_shinhan_html(html_bytes: bytes, password: str) -> str:
     onclick="check_value()")을 그대로 씀. 현대카드처럼 숨겨진 필드에 JS로 값을
     주입하는 우회가 필요 없음.
 
-    주의: 실제 비밀번호를 아직 확보하지 못해 이 함수는 세션 안에서 종단 검증이
-    안 됨(2026-09-22 기준). 비밀번호 오류 시 얼럿이 뜨는지, "더보기" 류
-    페이지네이션이 있는지도 미확인이라 삼성카드 케이스를 참고해 방어적으로
-    둘 다 처리해둠. 운영 반영 전 test_local.py로 실제 비밀번호를 넣어 반드시
-    재검증할 것.
+    2026-09-22 실제 파일 + 실제 비밀번호로 종단 검증 완료(test_local.py): 비밀번호
+    해제 직후 기본 화면은 "이용대금명세서" 요약 탭(#email01)이고, 실제 거래 내역은
+    "카드이용내역" 탭(#email02)에 있음 — CSS로 숨겨진 상태라 inner_text("body")가
+    건너뛰므로 반드시 그 탭을 클릭해서 보이게 만든 뒤 추출해야 함(탭 전환 없이는
+    거래 0건으로 파싱됨). 해당 첨부는 "더보기" 류 페이지네이션 없이 전체 41건이
+    한 번에 DOM에 있었으나, 다른 카드사 사례를 참고해 방어적으로 처리는 남겨둠.
+    비밀번호 오류 시 얼럿이 뜨는지는 아직 미확인.
     """
     from playwright.sync_api import sync_playwright
 
@@ -393,6 +395,15 @@ def decrypt_shinhan_html(html_bytes: bytes, password: str) -> str:
             browser.close()
             os.unlink(html_path)
             raise ValueError(f"신한카드 HTML 복호화 실패: {dialog_messages[0]}")
+
+        # 2026-09-22 실제 파일로 확인: 비밀번호 해제 직후 기본으로 보이는 화면은
+        # "이용대금명세서" 요약 탭(#email01, 결제금액·한도 안내 등)이고, 가맹점/일자/
+        # 금액이 있는 실제 거래 내역은 "카드이용내역" 탭(#email02)에 들어 있음. 탭
+        # 전환 전에는 #email02가 DOM에는 있어도 CSS로 숨겨져 있어(display:none)
+        # inner_text("body")가 건너뛰므로, 반드시 이 탭을 클릭해서 보이게 만든 뒤
+        # 텍스트를 추출해야 함 — 그 전까지는 거래 0건으로 파싱되는 버그가 있었음.
+        page.click("a[href='#email02']")
+        page.wait_for_timeout(1500)
 
         # 현대카드/삼성카드 경험상 "더보기" 류 페이지네이션이 있을 수 있어
         # 방어적으로 끝까지 클릭 시도(없으면 바로 통과).

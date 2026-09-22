@@ -31,6 +31,7 @@ load_dotenv()
 from main import (
     decrypt_bc_pdf,
     decrypt_shinhan_pdf,
+    decrypt_shinhan_html,
     decrypt_hyundai_html,
     decrypt_samsung_html,
     parse_transactions,
@@ -44,7 +45,7 @@ SEARCHES = [
     {"card_type": "BC", "card_name": "BC바로카드", "raw_query": "subject:BC바로카드 subject:명세서", "ext": ".pdf"},
     {"card_type": "HYUNDAI", "card_name": "현대카드", "raw_query": "subject:현대카드 subject:명세서", "ext": (".html", ".htm")},
     {"card_type": "SAMSUNG", "card_name": "삼성카드", "raw_query": "subject:삼성카드 subject:명세서", "ext": (".html", ".htm")},
-    {"card_type": "SHINHAN", "card_name": "신한카드", "raw_query": "subject:신한카드 subject:명세서", "ext": ".pdf"},
+    {"card_type": "SHINHAN", "card_name": "신한카드", "raw_query": "subject:신한카드 subject:명세서", "ext": (".pdf", ".html", ".htm")},
 ]
 
 ENV_PASSWORD_KEY = {
@@ -156,8 +157,12 @@ def main():
                         images = decrypt_bc_pdf(file_bytes, password)
                         transactions = parse_transactions(s["card_name"], page_images=images)
                     elif s["card_type"] == "SHINHAN":
-                        images = decrypt_shinhan_pdf(file_bytes, password)
-                        transactions = parse_transactions(s["card_name"], page_images=images)
+                        if filename.lower().endswith((".html", ".htm")):
+                            text = decrypt_shinhan_html(file_bytes, password)
+                            transactions = parse_transactions(s["card_name"], raw_text=text)
+                        else:  # .pdf
+                            images = decrypt_shinhan_pdf(file_bytes, password)
+                            transactions = parse_transactions(s["card_name"], page_images=images)
                     elif s["card_type"] == "HYUNDAI":
                         text = decrypt_hyundai_html(file_bytes, password)
                         transactions = parse_transactions(s["card_name"], raw_text=text)
