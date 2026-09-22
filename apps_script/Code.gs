@@ -26,7 +26,7 @@
 // BC바로카드는 명세서가 PDF 또는 엑셀(xlsx/xls) 둘 중 하나로 올 수 있어 둘 다 허용.
 const ACCEPTED_EXTENSIONS = {
   BC: ['.pdf', '.xlsx', '.xls'],
-  SHINHAN: ['.pdf'],
+  SHINHAN: ['.pdf', '.html', '.htm'],
   HYUNDAI: ['.html', '.htm'],
   SAMSUNG: ['.html', '.htm'],
 };

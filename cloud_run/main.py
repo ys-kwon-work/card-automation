@@ -11,8 +11,12 @@ Apps Script가 Gmail에서 찾은 첨부파일(base64)을 이 서비스로 보�
                     현대카드와 달리 진짜 표시형 입력칸을 쓰고, "더보기" 페이지네이션이
                     실제 데이터 누락을 유발하므로 전체 페이지를 다 볼 때까지 클릭함
                     (2026-08-25 실제 파일로 확인).
-  2-C. 신한카드  -> BC바로카드와 동일하게 암호 PDF + 폰트 스크램블(안티카피)이 확인되어
-                    같은 이미지 렌더링 방식을 재사용함(2026-08-26 실제 파일로 확인).
+  2-C. 신한카드  -> 실제 메일 첨부는 자체 암호화 HTML(2026-09-22 실제 수신 메일로
+                    확인, rimesoft/UniSafeMail 방식 — 삼성카드처럼 진짜 표시형
+                    비밀번호 입력칸을 씀). 2026-08-26에 확인했던 "암호 PDF + 폰트
+                    스크램블" 경로는 카드사 홈페이지에서 수동 다운로드한 파일 기준으로
+                    보이며 호환을 위해 남겨두고, 첨부 확장자(.pdf vs .html/.htm)로
+                    자동 분기함.
   3. AI로 (이미지 또는 텍스트를) 거래내역 JSON으로 파싱
      — Gemini API와 Claude API 둘 다 지원하며, 환경변수 PARSER_ENGINE으로 선택
        ("gemini" 또는 "claude", 기본값 "claude"). 둘 다 코드에 남겨뒀으니 필요하면
@@ -263,6 +267,71 @@ def decrypt_shinhan_pdf(pdf_bytes: bytes, password: str) -> list[bytes]:
     """신한카드 명세서 PDF. BC바로카드와 동일하게 폰트 스크램블이 확인되어(2026-08-26)
     같은 이미지 렌더링 방식을 그대로 사용합니다."""
     return _decrypt_pdf_to_page_images(pdf_bytes, password)
+
+
+def decrypt_shinhan_html(html_bytes: bytes, password: str) -> str:
+    """신한카드 명세서: 실제 이메일 자동화 대상 메일의 첨부는 PDF가 아니라
+    자체 암호화된 HTML임(2026-09-22, 실제 수신 메일로 확인). 2026-08-26에
+    decrypt_shinhan_pdf()로 검증했던 PDF는 카드사 홈페이지에서 수동으로 내려받은
+    파일이었던 것으로 보이며, 실제 메일 첨부 형식과는 다른 것으로 판단됨.
+
+    HTML 구조: rimesoft(UniSafeMail, "20140701" 빌드) 방식의 자체 암호화 HTML.
+    삼성카드와 마찬가지로 위장 입력칸이 없고, 진짜 표시형 비밀번호 입력칸
+    (id="password", type="password")과 버튼(class="btnPW02",
+    onclick="check_value()")을 그대로 씀. 현대카드처럼 숨겨진 필드에 JS로 값을
+    주입하는 우회가 필요 없음.
+
+    주의: 실제 비밀번호를 아직 확보하지 못해 이 함수는 세션 안에서 종단 검증이
+    안 됨(2026-09-22 기준). 비밀번호 오류 시 얼럿이 뜨는지, "더보기" 류
+    페이지네이션이 있는지도 미확인이라 삼성카드 케이스를 참고해 방어적으로
+    둘 다 처리해둠. 운영 반영 전 test_local.py로 실제 비밀번호를 넣어 반드시
+    재검증할 것.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+        f.write(html_bytes)
+        html_path = f.name
+
+    headless = os.environ.get("DEBUG_HEADED") != "1"
+
+    dialog_messages: list[str] = []
+    extracted_text = ""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+        page = browser.new_page()
+        page.on("dialog", lambda d: (dialog_messages.append(d.message), d.accept()))
+        page.goto(f"file://{html_path}")
+
+        page.fill("#password", password)
+        page.click(".btnPW02")
+        page.wait_for_timeout(6000)
+
+        if dialog_messages:
+            browser.close()
+            os.unlink(html_path)
+            raise ValueError(f"신한카드 HTML 복호화 실패: {dialog_messages[0]}")
+
+        # 현대카드/삼성카드 경험상 "더보기" 류 페이지네이션이 있을 수 있어
+        # 방어적으로 끝까지 클릭 시도(없으면 바로 통과).
+        for _ in range(20):
+            more = page.locator("text=더보기")
+            if more.count() == 0:
+                break
+            try:
+                more.first.click(timeout=3000)
+            except Exception:
+                break
+            page.wait_for_timeout(2000)
+
+        extracted_text = page.inner_text("body")
+        browser.close()
+
+    os.unlink(html_path)
+
+    if not extracted_text.strip():
+        raise ValueError("신한카드 HTML 복호화 결과가 비어 있습니다.")
+    return extracted_text
 
 
 # ---------------------------------------------------------------------------
@@ -1039,8 +1108,13 @@ def process():
                 page_images = decrypt_bc_pdf(file_bytes, password)
                 transactions = parse_transactions(card_name, page_images=page_images)
         elif card_type == "SHINHAN":
-            page_images = decrypt_shinhan_pdf(file_bytes, password)
-            transactions = parse_transactions(card_name, page_images=page_images)
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in (".html", ".htm"):
+                raw_text = decrypt_shinhan_html(file_bytes, password)
+                transactions = parse_transactions(card_name, raw_text=raw_text)
+            else:  # .pdf (기본값)
+                page_images = decrypt_shinhan_pdf(file_bytes, password)
+                transactions = parse_transactions(card_name, page_images=page_images)
         elif card_type == "HYUNDAI":
             raw_text = decrypt_hyundai_html(file_bytes, password)
             transactions = parse_transactions(card_name, raw_text=raw_text)

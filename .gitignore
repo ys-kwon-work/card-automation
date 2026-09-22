@@ -1,4 +1,6 @@
 .env
+.venv/
+venv/
 __pycache__/
 *.pyc
 *.png
@@ -7,3 +9,6 @@ __pycache__/
 *.html
 env.yaml
 card-automation-506604-148c68e844bd.json
+rag/chunks.jsonl
+rag/chroma/
+rag/graph.json

@@ -25,7 +25,8 @@ GCP/Apps Script 세팅 없이, 실제 파일 + 실제 비밀번호로 복호화(
   python3 test_local.py hyundai "실제현대명세서.html"
   python3 test_local.py hyundai "실제현대명세서.html" "비밀번호"
   python3 test_local.py samsung "실제삼성명세서.html"
-  python3 test_local.py shinhan "실제신한명세서.pdf"
+  python3 test_local.py shinhan "실제신한명세서.html"       # 실제 메일 첨부 형식(2026-09-22 확인)
+  python3 test_local.py shinhan "실제신한명세서.pdf"        # 카드사 홈페이지 수동 다운로드 등 PDF인 경우
 
 BC바로카드(PDF)/신한카드는 텍스트 대신 페이지 이미지(PNG)를 생성합니다 — 이 두
 카드사 PDF는 복사/추출 방지를 위해 텍스트 레이어가 스크램블되어 있어(둘 다 실제
@@ -48,6 +49,7 @@ from main import (
     decrypt_bc_pdf,
     decrypt_bc_excel,
     decrypt_shinhan_pdf,
+    decrypt_shinhan_html,
     decrypt_hyundai_html,
     decrypt_samsung_html,
     parse_transactions,
@@ -115,6 +117,11 @@ def main():
     if card_type == "bc" and ext in (".xlsx", ".xls"):
         # BC바로카드는 PDF 대신 엑셀로 올 수도 있음 — 확장자로 자동 판별
         text = decrypt_bc_excel(file_bytes, password)
+        _run_text_path(card_name, text, parser_ready, engine_key_name)
+
+    elif card_type == "shinhan" and ext in (".html", ".htm"):
+        # 신한카드는 실제 메일 첨부가 PDF가 아니라 HTML임(2026-09-22 확인) — 확장자로 자동 판별
+        text = decrypt_shinhan_html(file_bytes, password)
         _run_text_path(card_name, text, parser_ready, engine_key_name)
 
     elif card_type in PDF_CARD_TYPES:
