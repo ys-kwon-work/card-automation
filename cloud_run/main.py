@@ -379,48 +379,93 @@ def decrypt_shinhan_html(html_bytes: bytes, password: str) -> str:
 
     headless = os.environ.get("DEBUG_HEADED") != "1"
 
+    def _describe_page(page) -> str:
+        # 구조가 예상과 다를 때 Apps Script/Cloud Run 로그만 보고 원인을 알 수 있게 함.
+        try:
+            elements = page.evaluate(
+                "() => Array.from(document.querySelectorAll('input,button,a[onclick]'))"
+                ".slice(0, 20).map(e => e.tagName + '#' + e.id + '.' + e.className + '[' + (e.type || '') + ']').join(', ')"
+            )
+            body = page.inner_text("body")[:200].replace("\n", " ")
+            return f"title={page.title()!r}, frames={len(page.frames)}, 요소=[{elements}], 본문앞부분={body!r}"
+        except Exception as exc:
+            return f"(페이지 진단 실패: {exc})"
+
     dialog_messages: list[str] = []
     extracted_text = ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        page = browser.new_page()
-        page.on("dialog", lambda d: (dialog_messages.append(d.message), d.accept()))
-        page.goto(f"file://{html_path}")
-
-        page.fill("#password", password)
-        page.click(".btnPW02")
-        page.wait_for_timeout(6000)
-
-        if dialog_messages:
-            browser.close()
-            os.unlink(html_path)
-            raise ValueError(f"신한카드 HTML 복호화 실패: {dialog_messages[0]}")
-
-        # 2026-09-22 실제 파일로 확인: 비밀번호 해제 직후 기본으로 보이는 화면은
-        # "이용대금명세서" 요약 탭(#email01, 결제금액·한도 안내 등)이고, 가맹점/일자/
-        # 금액이 있는 실제 거래 내역은 "카드이용내역" 탭(#email02)에 들어 있음. 탭
-        # 전환 전에는 #email02가 DOM에는 있어도 CSS로 숨겨져 있어(display:none)
-        # inner_text("body")가 건너뛰므로, 반드시 이 탭을 클릭해서 보이게 만든 뒤
-        # 텍스트를 추출해야 함 — 그 전까지는 거래 0건으로 파싱되는 버그가 있었음.
-        page.click("a[href='#email02']")
-        page.wait_for_timeout(1500)
-
-        # 현대카드/삼성카드 경험상 "더보기" 류 페이지네이션이 있을 수 있어
-        # 방어적으로 끝까지 클릭 시도(없으면 바로 통과).
-        for _ in range(20):
-            more = page.locator("text=더보기")
-            if more.count() == 0:
-                break
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
             try:
-                more.first.click(timeout=3000)
-            except Exception:
-                break
-            page.wait_for_timeout(2000)
+                page = browser.new_page()
+                page.on("dialog", lambda d: (dialog_messages.append(d.message), d.accept()))
+                # 외부 리소스(shinhancard.com 이미지/스크립트)가 느리거나 막혀 있어도
+                # 로드 완료를 기다리다 멈추지 않도록 DOM 구성 시점까지만 기다림.
+                page.goto(f"file://{html_path}", wait_until="domcontentloaded")
 
-        extracted_text = page.inner_text("body")
-        browser.close()
+                # 비밀번호 입력칸 탐색: 9월 파일은 #password였지만, 템플릿이 바뀌어도
+                # (id 변경/iframe 안으로 이동) 찾을 수 있게 type=password도 허용하고
+                # 모든 프레임을 훑음. 15초 안에 없으면 이미 열려 있는 페이지로 간주.
+                pw_frame = pw_input = None
+                for _ in range(30):
+                    for frame in page.frames:
+                        loc = frame.locator("#password, input[type=password]")
+                        if loc.count() and loc.first.is_visible():
+                            pw_frame, pw_input = frame, loc.first
+                            break
+                    if pw_input:
+                        break
+                    page.wait_for_timeout(500)
 
-    os.unlink(html_path)
+                if pw_input:
+                    pw_input.fill(password)
+                    btn = pw_frame.locator(".btnPW02")
+                    if btn.count():
+                        btn.first.click()
+                    else:
+                        pw_input.press("Enter")
+                    page.wait_for_timeout(6000)
+
+                    if dialog_messages:
+                        raise ValueError(f"신한카드 HTML 복호화 실패: {dialog_messages[0]}")
+
+                # 2026-09-22 실제 파일로 확인: 비밀번호 해제 직후 기본으로 보이는 화면은
+                # "이용대금명세서" 요약 탭(#email01, 결제금액·한도 안내 등)이고, 가맹점/일자/
+                # 금액이 있는 실제 거래 내역은 "카드이용내역" 탭(#email02)에 들어 있음. 탭
+                # 전환 전에는 #email02가 DOM에는 있어도 CSS로 숨겨져 있어(display:none)
+                # inner_text("body")가 건너뛰므로, 반드시 이 탭을 클릭해서 보이게 만든 뒤
+                # 텍스트를 추출해야 함 — 그 전까지는 거래 0건으로 파싱되는 버그가 있었음.
+                tab = page.locator("a[href='#email02']")
+                if tab.count():
+                    tab.first.click()
+                    page.wait_for_timeout(1500)
+
+                # 현대카드/삼성카드 경험상 "더보기" 류 페이지네이션이 있을 수 있어
+                # 방어적으로 끝까지 클릭 시도(없으면 바로 통과).
+                for _ in range(20):
+                    more = page.locator("text=더보기")
+                    if more.count() == 0:
+                        break
+                    try:
+                        more.first.click(timeout=3000)
+                    except Exception:
+                        break
+                    page.wait_for_timeout(2000)
+
+                extracted_text = page.inner_text("body")
+
+                # 탭도 못 찾았고 거래 일자(YY.MM.DD)도 거의 안 보이면, 조용히 0건으로
+                # 파싱되지 않도록 진단 정보와 함께 명시적으로 실패시킴.
+                if not tab.count() and len(re.findall(r"\b\d{2}\.\d{2}\.\d{2}\b", extracted_text)) < 3:
+                    found = "비밀번호 입력 후" if pw_input else "비밀번호 입력칸 없음"
+                    raise ValueError(
+                        f"신한카드 HTML 구조가 예상과 다름({found}, '카드이용내역' 탭 없음): "
+                        + _describe_page(page)
+                    )
+            finally:
+                browser.close()
+    finally:
+        os.unlink(html_path)
 
     if not extracted_text.strip():
         raise ValueError("신한카드 HTML 복호화 결과가 비어 있습니다.")
